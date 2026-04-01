@@ -1,87 +1,144 @@
 """
-Awesome 1-step MNIST Generation with Mean Flows
-1-step Mean Flows training on MNIST dataset.
+One-step MeanFlow training centered on this file.
+
+Commit 1 keeps the original algorithmic scope:
+- MNIST
+- U-Net backbone
+- MeanFlow objective
+- Adam optimizer
 """
 
-# Install required library if not present
-try:
-    import einops
-except ImportError:
-    !pip install einops
-    import einops
+from __future__ import annotations
 
-import os
-import math
-import random
-import torch
-from torch import nn
-from torch import einsum
-import torch.nn.functional as F
-import numpy as np
-from torchvision.datasets import MNIST
-import torchvision.transforms as T
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from datetime import datetime
-from inspect import isfunction
-from functools import partial
-from einops import rearrange
+import argparse
 import json
+import math
+import os
+import random
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from functools import partial
+from inspect import isfunction
+from pathlib import Path
+from typing import Any
 
-plt.rcParams['figure.figsize'] = (5, 5)
-plt.rcParams['image.cmap'] = 'gray'
-
-# Updated paths for Colab environment
-LOGS_DIR = './logs'
-os.makedirs(LOGS_DIR, exist_ok=True)
-DATA_DIR = './data'
-os.makedirs(DATA_DIR, exist_ok=True)
-
-
-# ============================================================================
-# Utility functions
-# ============================================================================
-
-def grid(array, ncols=8):
-    array = np.pad(array, [(0, 0), (1, 1), (1, 1), (0, 0)], 'constant')
-    nindex, height, width, intensity = array.shape
-    ncols = min(nindex, ncols)
-    nrows = (nindex + ncols - 1) // ncols
-    r = nrows * ncols - nindex
-    arr = np.concatenate([array] + [np.zeros([1, height, width, intensity])] * r)
-    result = (
-        arr.reshape(nrows, ncols, height, width, intensity)
-        .swapaxes(1, 2)
-        .reshape(height * nrows, width * ncols, intensity)
-    )
-    return np.pad(result, [(1, 1), (1, 1), (0, 0)], 'constant')
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import einsum, nn
+from torch.utils.data import DataLoader
+from torchvision import transforms as T
+from torchvision.datasets import MNIST
+from torchvision.utils import make_grid, save_image
+from tqdm import tqdm
 
 
-class NextDataLoader(torch.utils.data.DataLoader):
-    def __next__(self):
-        try:
-            return next(self.iterator)
-        except Exception:
-            self.iterator = self.__iter__()
-            return next(self.iterator)
-
-
-def exists(x):
+def exists(x: Any) -> bool:
     return x is not None
 
 
-def default(val, d):
+def default(val: Any, d: Any) -> Any:
     if exists(val):
         return val
     return d() if isfunction(d) else d
 
 
-# ============================================================================
-# Utility functions for neural networks
-# ============================================================================
+def cycle(loader: DataLoader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def to_serializable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def channel_last_vector_to_spatial(x: torch.Tensor) -> torch.Tensor:
+    return x[:, :, None, None]
+
+
+def conv_qkv_to_heads(x: torch.Tensor, heads: int) -> torch.Tensor:
+    batch, channels, height, width = x.shape
+    dim_head = channels // heads
+    return x.view(batch, heads, dim_head, height * width)
+
+
+def heads_to_spatial(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    batch, heads, tokens, dim_head = x.shape
+    return x.permute(0, 1, 3, 2).contiguous().view(batch, heads * dim_head, height, width)
+
+
+def heads_channels_to_spatial(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    batch, heads, channels, tokens = x.shape
+    return x.contiguous().view(batch, heads * channels, height, width)
+
+
+@dataclass
+class TrainConfig:
+    workdir: str = "./runs/mnist_meanflow"
+    data_root: str = "./data"
+    resume: str = ""
+    seed: int = 1024
+    max_steps: int = 100000
+    batch_size: int = 512
+    eval_every: int = 5000
+    sample_every: int = 5000
+    save_every: int = 5000
+    num_workers: int = 2
+    sample_batch_size: int = 16
+    lr: float = 1e-4
+    beta1: float = 0.9
+    beta2: float = 0.99
+    eps: float = 1e-8
+    grad_clip: float = 1.0
+    model_dim: int = 32
+    dim_mults: tuple[int, ...] = (1, 2, 4)
+    convnext_mult: int = 2
+    channels: int = 1
+    image_size: int = 32
+    t_min: float = 0.02
+    p_mean: float = -0.4
+    p_std: float = 1.0
+    norm_p: float = 1.0
+    norm_eps: float = 1.0
+    noise_dist: str = "logit_normal"
+    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    name: str
+    channels: int
+    image_size: int
+    mean: tuple[float, ...]
+    std: tuple[float, ...]
+
+
+@dataclass
+class RunState:
+    step: int = 0
+    best_val_loss: float = float("inf")
+    train_loss: list[float] = field(default_factory=list)
+    val_loss: list[float] = field(default_factory=list)
+
 
 class Residual(nn.Module):
-    def __init__(self, fn):
+    def __init__(self, fn: nn.Module):
         super().__init__()
         self.fn = fn
 
@@ -89,54 +146,32 @@ class Residual(nn.Module):
         return self.fn(x, *args, **kwargs) + x
 
 
-def Upsample(dim):
+def Upsample(dim: int) -> nn.Module:
     return nn.ConvTranspose2d(dim, dim, 4, 2, 1)
 
 
-def Downsample(dim):
+def Downsample(dim: int) -> nn.Module:
     return nn.Conv2d(dim, dim, 4, 2, 1)
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
-    def forward(self, time):
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
         device = time.device
         half_dim = self.dim // 2
-        embeddings = math.log(10000) / max(half_dim - 1, 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
-
-
-class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups=8):
-        super().__init__()
-        self.proj = nn.Conv2d(dim, dim_out, 3, padding=1)
-        self.norm = nn.GroupNorm(groups, dim_out)
-        self.act = nn.SiLU()
-
-    def forward(self, x, scale_shift=None):
-        x = self.proj(x)
-        x = self.norm(x)
-        if exists(scale_shift):
-            scale, shift = scale_shift
-            x = x * (scale + 1) + shift
-        x = self.act(x)
-        return x
+        scale = math.log(10000) / max(half_dim - 1, 1)
+        freqs = torch.exp(torch.arange(half_dim, device=device) * -scale)
+        embeddings = time[:, None] * freqs[None, :]
+        return torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
 
 
 class ConvNextBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, mult=2, norm=True):
+    def __init__(self, dim: int, dim_out: int, *, time_emb_dim: int | None = None, mult: int = 2, norm: bool = True):
         super().__init__()
-        self.mlp = (
-            nn.Sequential(nn.GELU(), nn.Linear(time_emb_dim, dim))
-            if exists(time_emb_dim)
-            else None
-        )
+        self.mlp = nn.Sequential(nn.GELU(), nn.Linear(time_emb_dim, dim)) if exists(time_emb_dim) else None
         self.ds_conv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
         self.net = nn.Sequential(
             nn.GroupNorm(1, dim) if norm else nn.Identity(),
@@ -147,17 +182,17 @@ class ConvNextBlock(nn.Module):
         )
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
-    def forward(self, x, time_emb=None):
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor | None = None) -> torch.Tensor:
         h = self.ds_conv(x)
         if exists(self.mlp) and exists(time_emb):
             condition = self.mlp(time_emb)
-            h = h + rearrange(condition, "b c -> b c 1 1")
+            h = h + channel_last_vector_to_spatial(condition)
         h = self.net(h)
         return h + self.res_conv(x)
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
+    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
@@ -165,82 +200,73 @@ class Attention(nn.Module):
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, _, height, width = x.shape
         q, k, v = map(
-            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+            lambda t: conv_qkv_to_heads(t, self.heads),
+            self.to_qkv(x).chunk(3, dim=1),
         )
         q = q * self.scale
         sim = einsum("b h d i, b h d j -> b h i j", q, k)
         sim = sim - sim.amax(dim=-1, keepdim=True).detach()
         attn = sim.softmax(dim=-1)
         out = einsum("b h i j, b h d j -> b h i d", attn, v)
-        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
+        out = heads_to_spatial(out, height, width)
         return self.to_out(out)
 
 
 class LinearAttention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32):
+    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
         hidden_dim = dim_head * heads
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = nn.Sequential(
-            nn.Conv2d(hidden_dim, dim, 1),
-            nn.GroupNorm(1, dim)
-        )
+        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), nn.GroupNorm(1, dim))
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.to_qkv(x).chunk(3, dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, _, height, width = x.shape
         q, k, v = map(
-            lambda t: rearrange(t, "b (h c) x y -> b h c (x y)", h=self.heads), qkv
+            lambda t: conv_qkv_to_heads(t, self.heads),
+            self.to_qkv(x).chunk(3, dim=1),
         )
         q = q.softmax(dim=-2)
         k = k.softmax(dim=-1)
         q = q * self.scale
         context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
         out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
-        out = rearrange(out, "b h c (x y) -> b (h c) x y", h=self.heads, x=h, y=w)
+        out = heads_channels_to_spatial(out, height, width)
         return self.to_out(out)
 
 
 class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
+    def __init__(self, dim: int, fn: nn.Module):
         super().__init__()
         self.fn = fn
         self.norm = nn.GroupNorm(1, dim)
 
-    def forward(self, x):
-        x = self.norm(x)
-        return self.fn(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fn(self.norm(x))
 
-
-# ============================================================================
-# Neural Network (Unet)
-# ============================================================================
 
 class Unet(nn.Module):
     def __init__(
         self,
-        dim,
-        init_dim=None,
-        out_dim=None,
-        dim_mults=(1, 2, 4, 8),
-        channels=1,
-        with_time_emb=True,
-        convnext_mult=2,
+        dim: int,
+        init_dim: int | None = None,
+        out_dim: int | None = None,
+        dim_mults: tuple[int, ...] = (1, 2, 4, 8),
+        channels: int = 1,
+        with_time_emb: bool = True,
+        convnext_mult: int = 2,
     ):
         super().__init__()
-        self.channels = channels
         init_dim = default(init_dim, dim // 3 * 2)
-        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding=3)
-
-        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        dims = [init_dim, *map(lambda mult: dim * mult, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
-        block_klass = partial(ConvNextBlock, mult=convnext_mult)
+        block = partial(ConvNextBlock, mult=convnext_mult)
+
+        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding=3)
 
         if with_time_emb:
             time_dim = dim * 4
@@ -261,571 +287,420 @@ class Unet(nn.Module):
             self.time_mlp = None
             self.time_mlp_h = None
 
-        self.downs = nn.ModuleList([])
-        self.ups = nn.ModuleList([])
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
         num_resolutions = len(in_out)
 
-        for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = ind >= (num_resolutions - 1)
-            self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_out, time_emb_dim=time_dim),
-                block_klass(dim_out, dim_out, time_emb_dim=time_dim),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Downsample(dim_out) if not is_last else nn.Identity(),
-            ]))
+        for index, (dim_in, dim_out) in enumerate(in_out):
+            is_last = index >= (num_resolutions - 1)
+            self.downs.append(
+                nn.ModuleList(
+                    [
+                        block(dim_in, dim_out, time_emb_dim=time_dim),
+                        block(dim_out, dim_out, time_emb_dim=time_dim),
+                        Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                        Downsample(dim_out) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
 
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
+        self.mid_block1 = block(mid_dim, mid_dim, time_emb_dim=time_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
-        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
+        self.mid_block2 = block(mid_dim, mid_dim, time_emb_dim=time_dim)
 
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
-            is_last = ind >= (num_resolutions - 1)
-            self.ups.append(nn.ModuleList([
-                block_klass(dim_out * 2, dim_in, time_emb_dim=time_dim),
-                block_klass(dim_in, dim_in, time_emb_dim=time_dim),
-                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
-                Upsample(dim_in) if not is_last else nn.Identity(),
-            ]))
+        for index, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = index >= (num_resolutions - 1)
+            self.ups.append(
+                nn.ModuleList(
+                    [
+                        block(dim_out * 2, dim_in, time_emb_dim=time_dim),
+                        block(dim_in, dim_in, time_emb_dim=time_dim),
+                        Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                        Upsample(dim_in) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
 
         out_dim = default(out_dim, channels)
-        self.final_conv = nn.Sequential(
-            block_klass(dim, dim),
-            nn.Conv2d(dim, out_dim, 1)
-        )
+        self.final_conv = nn.Sequential(block(dim, dim), nn.Conv2d(dim, out_dim, 1))
 
-    def forward(self, x, time, h=None):
+    def forward(self, x: torch.Tensor, time: torch.Tensor, h: torch.Tensor | None = None) -> torch.Tensor:
         x = self.init_conv(x)
-        t = self.time_mlp(time) if exists(self.time_mlp) else None
-        if h is not None and exists(self.time_mlp_h):
-            t = t + self.time_mlp_h(h)
+        time_emb = self.time_mlp(time) if exists(self.time_mlp) else None
+        if exists(h) and exists(self.time_mlp_h):
+            time_emb = time_emb + self.time_mlp_h(h)
 
-        h_list = []
+        residuals = []
         for block1, block2, attn, downsample in self.downs:
-            x = block1(x, t)
-            x = block2(x, t)
+            x = block1(x, time_emb)
+            x = block2(x, time_emb)
             x = attn(x)
-            h_list.append(x)
+            residuals.append(x)
             x = downsample(x)
 
-        x = self.mid_block1(x, t)
+        x = self.mid_block1(x, time_emb)
         x = self.mid_attn(x)
-        x = self.mid_block2(x, t)
+        x = self.mid_block2(x, time_emb)
 
         for block1, block2, attn, upsample in self.ups:
-            x = torch.cat((x, h_list.pop()), dim=1)
-            x = block1(x, t)
-            x = block2(x, t)
+            x = torch.cat((x, residuals.pop()), dim=1)
+            x = block1(x, time_emb)
+            x = block2(x, time_emb)
             x = attn(x)
             x = upsample(x)
 
         return self.final_conv(x)
 
 
-# ============================================================================
-# Core MeanFlow Corruption Logic
-# ============================================================================
-
-def _build_meanflow_corruption(x0, eps, tau):
-    """
-    Standard MeanFlow interpolation path:
-        x_tau = (1 - tau) * x0 + tau * eps
-    tau shape: [B,1,1,1]
-    """
+def build_meanflow_corruption(x0: torch.Tensor, eps: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
     return (1.0 - tau) * x0 + tau * eps
 
-
-# ============================================================================
-# MeanFlow Loss Function
-# ============================================================================
 
 class MeanFlowLoss:
     def __init__(
         self,
-        P_mean=-0.4,
-        P_std=1.0,
-        noise_dist='logit_normal',
-        data_proportion=1.0,
-        norm_p=1.0,
-        norm_eps=1.0,
-        t_min=0.02,
-        use_fixed_t_r=False,
+        p_mean: float = -0.4,
+        p_std: float = 1.0,
+        noise_dist: str = "logit_normal",
+        norm_p: float = 1.0,
+        norm_eps: float = 1.0,
+        t_min: float = 0.02,
     ):
-        self.P_mean = P_mean
-        self.P_std = P_std
-        self.data_proportion = data_proportion
+        self.p_mean = p_mean
+        self.p_std = p_std
+        self.noise_dist = noise_dist
         self.norm_p = norm_p
         self.norm_eps = norm_eps
-        self.noise_dist = noise_dist
         self.t_min = t_min
-        self.use_fixed_t_r = use_fixed_t_r
 
-    def _logit_normal_dist(self, shape, device):
-        rnd_normal = torch.randn(shape, device=device)
-        return torch.sigmoid(rnd_normal * self.P_std + self.P_mean)
+    def noise_distribution(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        if self.noise_dist == "logit_normal":
+            rnd_normal = torch.randn(shape, device=device)
+            return torch.sigmoid(rnd_normal * self.p_std + self.p_mean)
+        if self.noise_dist == "uniform":
+            return torch.rand(shape, device=device)
+        raise ValueError(f"Unknown noise distribution: {self.noise_dist}")
 
-    def _uniform_dist(self, shape, device):
-        return torch.rand(shape, device=device)
-
-    def noise_distribution(self, shape, device):
-        if self.noise_dist == 'logit_normal':
-            return self._logit_normal_dist(shape, device)
-        elif self.noise_dist == 'uniform':
-            return self._uniform_dist(shape, device)
-        else:
-            raise ValueError(f"Unknown noise distribution: {self.noise_dist}")
-
-    def __call__(self, net, images):
+    def __call__(self, net: nn.Module, images: torch.Tensor) -> torch.Tensor:
         x0 = images
+        batch = x0.shape[0]
         device = x0.device
-        B = x0.shape[0]
-        shape = (B, 1, 1, 1)
+        shape = (batch, 1, 1, 1)
 
-        # sample tau in [t_min, 1]
         tau = self.noise_distribution(shape, device)
         tau = self.t_min + (1.0 - self.t_min) * tau
-
-        # keep r = 0 for simple one-step learning
         r = torch.zeros(shape, device=device)
-
         eps = torch.randn_like(x0)
 
-        # path x_tau and its derivative v_g = d/dtau G_tau(...)
-        def corruption_of_tau(tau_in):
-            return _build_meanflow_corruption(x0, eps, tau_in)
+        def corruption_of_tau(tau_in: torch.Tensor) -> torch.Tensor:
+            return build_meanflow_corruption(x0, eps, tau_in)
 
-        x_t, v_g = torch.func.jvp(
-            corruption_of_tau,
-            (tau,),
-            (torch.ones_like(tau),)
+        x_t, v_g = torch.func.jvp(corruption_of_tau, (tau,), (torch.ones_like(tau),))
+
+        def u_wrapper(x: torch.Tensor, tau_val: torch.Tensor, r_val: torch.Tensor) -> torch.Tensor:
+            return net(x, tau_val.view(batch), h=(tau_val - r_val).view(batch))
+
+        u, du_dt = torch.func.jvp(
+            u_wrapper,
+            (x_t, tau, r),
+            (v_g, torch.ones_like(tau), torch.zeros_like(r)),
         )
 
-        def u_wrapper(x, tau_val, r_val):
-            t_flat = tau_val.view(B)
-            h_flat = (tau_val - r_val).view(B)
-            return net(x, t_flat, h=h_flat)
-
-        primals = (x_t, tau, r)
-        tangents = (v_g, torch.ones_like(tau), torch.zeros_like(r))
-        u, du_dtau = torch.func.jvp(u_wrapper, primals, tangents)
-
         h = torch.clamp(tau - r, min=0.0, max=1.0)
-        u_tgt = (v_g - h * du_dtau).detach()
-
-        err2 = (u - u_tgt).pow(2).mean(dim=[1, 2, 3])
+        u_target = (v_g - h * du_dt).detach()
+        err2 = (u - u_target).pow(2).mean(dim=[1, 2, 3])
 
         with torch.no_grad():
             adaptive_weight = 1.0 / (err2 + self.norm_eps).pow(self.norm_p)
 
-        loss = (err2 * adaptive_weight).mean()
-        return loss
+        return (err2 * adaptive_weight).mean()
 
 
-# ============================================================================
-# MeanFlow generation
-# ============================================================================
-
-def generate(mf, noise_x):
-    """
-    One-step MeanFlow generation:
-        x0 = x1 - u(x1, tau=1, h=1)
-    """
-    B = noise_x.shape[0]
-    device = noise_x.device
-    dtype = noise_x.dtype
-
-    tau_val = torch.ones(B, 1, 1, 1, device=device, dtype=dtype)
-    h_val = torch.ones_like(tau_val)
-
-    x1 = noise_x
-    x0 = x1 - mf(x1, tau_val.view(B), h_val.view(B))
-    return x0
+@torch.no_grad()
+def generate_meanflow(model: nn.Module, noise_x: torch.Tensor) -> torch.Tensor:
+    batch = noise_x.shape[0]
+    tau = torch.ones(batch, device=noise_x.device, dtype=noise_x.dtype)
+    h = torch.ones_like(tau)
+    return noise_x - model(noise_x, tau, h)
 
 
-# ============================================================================
-# Training loop
-# ============================================================================
+def get_dataset_spec() -> DatasetSpec:
+    return DatasetSpec(name="mnist", channels=1, image_size=32, mean=(0.5,), std=(0.5,))
 
-def train(
-    mf,
-    max_iter,
-    batch_size,
-    mf_opt_args,
-    num_workers,
-    val_interval,
-    checkpoint=None,
-    t_min=0.02,
-    p_mean=-0.4,
-    p_std=1.0,
-    norm_p=1.0,
-    norm_eps=1.0,
-    noise_dist='logit_normal',
-    args_dict=None,
-    seed=42,
-):
-    # ===== Seeds should be set in __main__ before model initialization =====
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    now = datetime.now()
-    timestamp = now.strftime('%Y%m%d-%H%M%S')
-    run_dir = f'./logs/mf-mnist-{timestamp}'
-    logs_loss_dir = os.path.join(run_dir, 'logs-loss-curve')
-    logs_sample_dir = os.path.join(run_dir, 'logs-sample')
+def build_datasets(config: TrainConfig):
+    spec = get_dataset_spec()
+    transform = T.Compose([T.ToTensor(), T.Pad(2), T.Normalize(spec.mean, spec.std)])
+    train_dataset = MNIST(config.data_root, train=True, transform=transform, download=True)
+    eval_dataset = MNIST(config.data_root, train=False, transform=transform, download=True)
+    return train_dataset, eval_dataset, spec
 
-    os.makedirs(logs_loss_dir, exist_ok=True)
-    os.makedirs(logs_sample_dir, exist_ok=True)
 
-    # Save configuration parameters to JSON file
-    if args_dict is not None:
-        config_file = os.path.join(run_dir, 'config.json')
-        config_with_meta = dict(args_dict)
-        config_with_meta['_reproducibility'] = {
-            'seed': seed,
-            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set'),
-            'torch_version': torch.__version__,
-            'numpy_version': np.__version__,
-        }
-        with open(config_file, 'w') as f:
-            json.dump(config_with_meta, f, indent=4)
-        print(f"Configuration saved to: {config_file}")
-
-    mean = 0.5
-    std = 0.5
-    dataset = MNIST(
-        './data',
-        transform=T.Compose([
-            T.ToTensor(),
-            T.Pad(2),
-            T.Normalize((mean,), (std,))
-        ]),
-        download=True
-    )
-
-    train_generator = torch.Generator()
-    train_generator.manual_seed(seed)
-
-    dataloader = torch.utils.data.DataLoader(
+def build_dataloader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed: int, drop_last: bool) -> DataLoader:
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
+        drop_last=drop_last,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
         prefetch_factor=2 if num_workers > 0 else None,
-        pin_memory=True,
-        generator=train_generator,
-        persistent_workers=(num_workers > 0),
-        drop_last=True,
+        generator=generator,
     )
 
-    eval_generator = torch.Generator()
-    eval_generator.manual_seed(seed)
 
-    eval_dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        prefetch_factor=2 if num_workers > 0 else None,
-        pin_memory=True,
-        generator=eval_generator,
-        persistent_workers=(num_workers > 0),
+def build_model(config: TrainConfig) -> nn.Module:
+    return Unet(
+        dim=config.model_dim,
+        channels=config.channels,
+        dim_mults=tuple(config.dim_mults),
+        convnext_mult=config.convnext_mult,
     )
 
-    eval_noise = torch.randn(64, 1, 32, 32, generator=train_generator).to(device)
 
-    mf_optimizer = torch.optim.Adam(mf.parameters(), **mf_opt_args)
-
-    mf_loss = MeanFlowLoss(
-        P_mean=p_mean,
-        P_std=p_std,
-        noise_dist=noise_dist,
-        data_proportion=1.0,
-        norm_p=norm_p,
-        norm_eps=norm_eps,
-        t_min=t_min,
-        use_fixed_t_r=False
-    )
-
-    loss_history = []
-    metrics = {
-        'train_loss': [],
-        'val_loss': [],
-        'avg_loss_window': 0.0,
-        'bes_val': float('inf'),
-    }
-    avg_val_loss = float('inf')
-
-    mf.train()
-    pbar = tqdm(range(max_iter), desc="Training MF-MNIST")
-
-    train_iter = iter(dataloader)
-
-    for i in pbar:
-        try:
-            x0 = next(train_iter)[0].to(device, non_blocking=True)
-        except StopIteration:
-            train_iter = iter(dataloader)
-            x0 = next(train_iter)[0].to(device, non_blocking=True)
-
-        loss = mf_loss(mf, x0)
-        loss_item = loss.item()
-        loss_history.append(loss_item)
-        metrics['train_loss'].append(loss_item)
-
-        mf_optimizer.zero_grad()
-        loss.backward()
-
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(mf.parameters(), 1.0)
-        mf_optimizer.step()
-
-        # Update metrics for display
-        window_size = min(100, len(metrics['train_loss']))
-        metrics['avg_loss_window'] = np.mean(metrics['train_loss'][-window_size:])
-
-        pbar.set_postfix({
-            'loss': f"{loss_item:.2e}",
-            'avg_loss': f"{metrics['avg_loss_window']:.2e}",
-            'val_loss': f"{avg_val_loss:.2e}" if len(metrics['val_loss']) > 0 else "N/A",
-            'bes_val': f"{metrics['bes_val']:.2e}" if metrics['bes_val'] != float('inf') else 'N/A'
-        })
-
-        # Validation and sample generation at regular intervals and at the final iteration
-        if i % val_interval == 0 or i == max_iter - 1:
-            mf.eval()
-            with torch.no_grad():
-                gen_x0 = generate(mf, eval_noise)
-
-                # Calculate validation loss on a subset of data
-                val_loss_sum = 0.0
-                val_batches = 0
-                eval_iter = iter(eval_dataloader)
-                for _ in range(min(5, len(eval_dataloader))):
-                    try:
-                        val_x0 = next(eval_iter)[0].to(device)
-                    except StopIteration:
-                        break
-                    val_loss = mf_loss(mf, val_x0)
-                    val_loss_sum += val_loss.item()
-                    val_batches += 1
-
-                avg_val_loss = val_loss_sum / max(val_batches, 1)
-                metrics['val_loss'].append(avg_val_loss)
-
-                # Track best validation loss
-                if avg_val_loss < metrics['bes_val']:
-                    metrics['bes_val'] = avg_val_loss
-
-            mf.train()
-
-            plt.figure(figsize=(5, 5))
-            gen_x0 = gen_x0.detach().permute(0, 2, 3, 1).clamp(-1, 1) * std + mean
-            plt.title('MeanFlow Sample', fontsize=17)
-            plt.imshow(grid(gen_x0.cpu()).squeeze())
-            plt.savefig(
-                os.path.join(logs_sample_dir, f'sample_iter_{i}.png'),
-                dpi=100,
-                bbox_inches='tight'
-            )
-            plt.show()
-            plt.close()
-
-            if i != 0:
-                plt.figure(figsize=(10, 4))
-
-                # Plot training loss
-                plt.subplot(1, 2, 1)
-                plt.plot(metrics['train_loss'], label='Training Loss', alpha=0.7)
-                plt.title('Training Loss Curve')
-                plt.xlabel('Iteration')
-                plt.ylabel('Loss')
-                plt.grid(True)
-                plt.legend()
-
-                # Plot validation loss
-                plt.subplot(1, 2, 2)
-                val_iters = [k for k, _ in enumerate(metrics['val_loss'])]
-                val_iter_steps = [k * val_interval for k in val_iters]
-                plt.plot(
-                    val_iter_steps,
-                    metrics['val_loss'],
-                    marker='o',
-                    label='Validation Loss',
-                    color='orange'
-                )
-                plt.title('Validation Loss Curve')
-                plt.xlabel('Iteration')
-                plt.ylabel('Loss')
-                plt.grid(True)
-                plt.legend()
-
-                plt.tight_layout()
-                plt.savefig(
-                    os.path.join(logs_loss_dir, f'loss_curve_iter_{i}.png'),
-                    dpi=100,
-                    bbox_inches='tight'
-                )
-                plt.show()
-                plt.close()
-
-            pbar.set_postfix({
-                'loss': f"{loss_item:.2e}",
-                'avg_loss': f"{metrics['avg_loss_window']:.2e}",
-                'val_loss': f"{avg_val_loss:.2e}",
-                'bes_val': f"{metrics['bes_val']:.2e}"
-            })
-
-    # Save model and metrics
-    torch.save({
-        'mf': mf.state_dict(),
-        'metrics': metrics,
-        'loss_history': loss_history,
-    }, os.path.join(run_dir, 'mnist_mf.pt'))
-
-    # Save metrics summary to text file
-    with open(os.path.join(run_dir, 'metrics_summary.txt'), 'w') as f:
-        f.write("Training Metrics Summary\n")
-        f.write("========================\n\n")
-        f.write(f"Total iterations: {max_iter}\n")
-        f.write(f"Final training loss: {metrics['train_loss'][-1]:.2e}\n")
-        f.write(f"Best validation loss: {metrics['bes_val']:.2e}\n")
-        f.write(f"Number of validation checkpoints: {len(metrics['val_loss'])}\n")
-        if len(metrics['val_loss']) > 0:
-            f.write(f"Final validation loss: {metrics['val_loss'][-1]:.2e}\n")
-            f.write(f"Min validation loss: {min(metrics['val_loss']):.2e}\n")
-            f.write(f"Max validation loss: {max(metrics['val_loss']):.2e}\n")
-
-    # Update configuration file with training results
-    if args_dict is not None:
-        config_file = os.path.join(run_dir, 'config.json')
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-
-        config['training_results'] = {
-            'train_loss': [round(loss, 3) for loss in metrics['train_loss']],
-            'valid_loss': [round(loss, 3) for loss in metrics['val_loss']] if len(metrics['val_loss']) > 0 else [],
-            'bes_val': round(metrics['bes_val'], 3) if metrics['bes_val'] != float('inf') else None
-        }
-
-        with open(config_file, 'w') as f:
-            json.dump(config, f, indent=4)
-
-    print(f'\nTraining ends~ Have a good Day!')
-    print(f'Results saved to: {run_dir}')
-    print(f'Final training loss: {metrics["train_loss"][-1]:.2e}')
-    print(f'Best validation loss: {metrics["bes_val"]:.2e}')
-    return metrics
+def get_run_dir(config: TrainConfig) -> Path:
+    if config.resume:
+        return Path(config.resume).resolve().parent.parent
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path(config.workdir).resolve() / timestamp
 
 
-# ============================================================================
-# Configuration Class (Replacing argparse)
-# ============================================================================
-
-class Config:
-    def __init__(self):
-        # ===== Training Parameters =====
-        self.max_iter = 100000
-        self.batch_size = 512
-        self.val_interval = 5000
-        self.num_workers = 2
-
-        # ===== Optimizer Parameters =====
-        self.lr = 1e-4
-        self.beta1 = 0.9
-        self.beta2 = 0.99
-        self.eps = 1e-08
-
-        # ===== Model Architecture Parameters =====
-        self.model_dim = 32
-        self.dim_mults = [1, 2, 4]
-        self.channels = 1
-        self.convnext_mult = 2
-
-        # ===== MeanFlow Loss Parameters =====
-        self.t_min = 0.02
-        self.p_mean = -0.4
-        self.p_std = 1.0
-        self.norm_p = 1.0
-        self.norm_eps = 1.0
-        self.noise_dist = 'logit_normal'
-
-        # ===== Reproducibility Parameters =====
-        self.seed = 1024
-
-        # ===== Device and Other Parameters =====
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.checkpoint = None
+def save_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
 
 
-# ============================================================================
-# Start training!
-# ============================================================================
+def save_sample_grid(samples: torch.Tensor, spec: DatasetSpec, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mean = torch.tensor(spec.mean, device=samples.device).view(1, -1, 1, 1)
+    std = torch.tensor(spec.std, device=samples.device).view(1, -1, 1, 1)
+    images = (samples.clamp(-1, 1) * std + mean).clamp(0, 1)
+    grid = make_grid(images, nrow=max(1, int(math.sqrt(images.shape[0]))))
+    save_image(grid, path)
 
-if __name__ == '__main__':
-    args = Config()
-    device = args.device
 
-    # Convert args to dictionary for saving configuration
-    args_dict = vars(args)
+def evaluate_meanflow(model: nn.Module, loss_fn: MeanFlowLoss, loader: DataLoader, device: torch.device, num_batches: int = 5) -> float:
+    model.eval()
+    losses = []
+    iterator = iter(loader)
+    with torch.no_grad():
+        for _ in range(min(num_batches, len(loader))):
+            images, _ = next(iterator)
+            losses.append(loss_fn(model, images.to(device)).item())
+    model.train()
+    return float(np.mean(losses)) if losses else float("nan")
 
-    train_params = {
-        'max_iter': args.max_iter,
-        'batch_size': args.batch_size,
-        'mf_opt_args': {
-            'lr': args.lr,
-            'betas': (args.beta1, args.beta2),
-            'eps': args.eps
+
+def make_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: TrainConfig,
+    state: RunState,
+) -> dict[str, Any]:
+    return {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": {key: to_serializable(value) for key, value in asdict(config).items()},
+        "state": {
+            "step": state.step,
+            "best_val_loss": state.best_val_loss,
+            "train_loss": state.train_loss,
+            "val_loss": state.val_loss,
         },
-        'num_workers': args.num_workers,
-        'val_interval': args.val_interval
+        "rng_state": {
+            "torch": torch.random.get_rng_state(),
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
     }
 
-    print("\n" + "=" * 60)
-    print("Training Configuration")
-    print("=" * 60)
-    print(f"Device: {device}")
-    print(f"Max iterations: {args.max_iter}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Model dim: {args.model_dim}")
-    print(f"Dim mults: {args.dim_mults}")
-    print(f"Channels: {args.channels}")
-    print(f"t_min: {args.t_min}")
-    print(f"p_mean: {args.p_mean}")
-    print(f"p_std: {args.p_std}")
-    print(f"norm_p: {args.norm_p}")
-    print(f"norm_eps: {args.norm_eps}")
-    print(f"noise_dist: {args.noise_dist}")
-    print(f"Seed: {args.seed}")
-    print("=" * 60 + "\n")
 
-    # ===== Set all random seeds BEFORE model initialization =====
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+def restore_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> RunState:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    torch.random.set_rng_state(checkpoint["rng_state"]["torch"])
+    np.random.set_state(checkpoint["rng_state"]["numpy"])
+    random.setstate(checkpoint["rng_state"]["python"])
+    if torch.cuda.is_available() and checkpoint["rng_state"]["cuda"] is not None:
+        torch.cuda.set_rng_state_all(checkpoint["rng_state"]["cuda"])
+    raw_state = checkpoint["state"]
+    return RunState(
+        step=raw_state["step"],
+        best_val_loss=raw_state["best_val_loss"],
+        train_loss=list(raw_state["train_loss"]),
+        val_loss=list(raw_state["val_loss"]),
+    )
 
-    # Create UNet model AFTER setting seeds
-    mf = Unet(
-        dim=args.model_dim,
-        channels=args.channels,
+
+def parse_args() -> TrainConfig:
+    parser = argparse.ArgumentParser(description="Train one-step MeanFlow on MNIST.")
+    parser.add_argument("--workdir", type=str, default="./runs/mnist_meanflow")
+    parser.add_argument("--data-root", type=str, default="./data")
+    parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--seed", type=int, default=1024)
+    parser.add_argument("--max-steps", type=int, default=100000)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--eval-every", type=int, default=5000)
+    parser.add_argument("--sample-every", type=int, default=5000)
+    parser.add_argument("--save-every", type=int, default=5000)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--sample-batch-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.99)
+    parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--model-dim", type=int, default=32)
+    parser.add_argument("--dim-mults", type=int, nargs="+", default=[1, 2, 4])
+    parser.add_argument("--convnext-mult", type=int, default=2)
+    parser.add_argument("--t-min", type=float, default=0.02)
+    parser.add_argument("--p-mean", type=float, default=-0.4)
+    parser.add_argument("--p-std", type=float, default=1.0)
+    parser.add_argument("--norm-p", type=float, default=1.0)
+    parser.add_argument("--norm-eps", type=float, default=1.0)
+    parser.add_argument("--noise-dist", type=str, choices=["logit_normal", "uniform"], default="logit_normal")
+    args = parser.parse_args()
+    return TrainConfig(
+        workdir=args.workdir,
+        data_root=args.data_root,
+        resume=args.resume,
+        seed=args.seed,
+        max_steps=args.max_steps,
+        batch_size=args.batch_size,
+        eval_every=args.eval_every,
+        sample_every=args.sample_every,
+        save_every=args.save_every,
+        num_workers=args.num_workers,
+        sample_batch_size=args.sample_batch_size,
+        lr=args.lr,
+        beta1=args.beta1,
+        beta2=args.beta2,
+        eps=args.eps,
+        grad_clip=args.grad_clip,
+        model_dim=args.model_dim,
         dim_mults=tuple(args.dim_mults),
-        convnext_mult=args.convnext_mult
-    ).to(device)
-
-    train(
-        mf,
-        **train_params,
+        convnext_mult=args.convnext_mult,
         t_min=args.t_min,
         p_mean=args.p_mean,
         p_std=args.p_std,
         norm_p=args.norm_p,
         norm_eps=args.norm_eps,
         noise_dist=args.noise_dist,
-        checkpoint=args.checkpoint,
-        args_dict=args_dict,
-        seed=args.seed
     )
+
+
+def train(config: TrainConfig) -> Path:
+    set_seed(config.seed)
+    device = torch.device(config.device)
+    run_dir = get_run_dir(config)
+    sample_dir = run_dir / "samples"
+    checkpoint_dir = run_dir / "checkpoints"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    train_dataset, eval_dataset, spec = build_datasets(config)
+    train_loader = build_dataloader(train_dataset, config.batch_size, True, config.num_workers, config.seed, True)
+    eval_loader = build_dataloader(eval_dataset, config.batch_size, False, config.num_workers, config.seed, False)
+    train_iter = cycle(train_loader)
+
+    model = build_model(config).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, betas=(config.beta1, config.beta2), eps=config.eps)
+    loss_fn = MeanFlowLoss(
+        p_mean=config.p_mean,
+        p_std=config.p_std,
+        noise_dist=config.noise_dist,
+        norm_p=config.norm_p,
+        norm_eps=config.norm_eps,
+        t_min=config.t_min,
+    )
+    state = RunState()
+
+    if config.resume:
+        state = restore_checkpoint(config.resume, model, optimizer, device)
+
+    save_json(
+        run_dir / "config.json",
+        {
+            "config": {key: to_serializable(value) for key, value in asdict(config).items()},
+            "dataset": asdict(spec),
+        },
+    )
+
+    sample_generator = torch.Generator(device=device.type if device.type == "cuda" else "cpu")
+    sample_generator.manual_seed(config.seed)
+    fixed_noise = torch.randn(
+        config.sample_batch_size,
+        spec.channels,
+        spec.image_size,
+        spec.image_size,
+        generator=sample_generator,
+        device=device,
+    )
+
+    progress = tqdm(range(state.step, config.max_steps), desc="Training MeanFlow-MNIST")
+
+    for step in progress:
+        images, _ = next(train_iter)
+        images = images.to(device, non_blocking=torch.cuda.is_available())
+
+        loss = loss_fn(model, images)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+        optimizer.step()
+
+        state.step = step + 1
+        state.train_loss.append(float(loss.item()))
+        avg_loss = float(np.mean(state.train_loss[-min(100, len(state.train_loss)) :]))
+        progress.set_postfix(loss=f"{loss.item():.2e}", avg=f"{avg_loss:.2e}", best=f"{state.best_val_loss:.2e}" if np.isfinite(state.best_val_loss) else "N/A")
+
+        should_eval = state.step % config.eval_every == 0 or state.step == config.max_steps
+        should_sample = state.step % config.sample_every == 0 or state.step == config.max_steps
+        should_save = state.step % config.save_every == 0 or state.step == config.max_steps
+
+        if should_eval:
+            val_loss = evaluate_meanflow(model, loss_fn, eval_loader, device)
+            state.val_loss.append(val_loss)
+            state.best_val_loss = min(state.best_val_loss, val_loss)
+            progress.set_postfix(loss=f"{loss.item():.2e}", avg=f"{avg_loss:.2e}", val=f"{val_loss:.2e}", best=f"{state.best_val_loss:.2e}")
+
+        if should_sample:
+            with torch.no_grad():
+                samples = generate_meanflow(model, fixed_noise)
+            save_sample_grid(samples, spec, sample_dir / f"step_{state.step:07d}.png")
+
+        if should_save:
+            checkpoint = make_checkpoint(model, optimizer, config, state)
+            torch.save(checkpoint, checkpoint_dir / "last.pt")
+            torch.save(checkpoint, checkpoint_dir / f"step_{state.step:07d}.pt")
+            if state.val_loss and state.val_loss[-1] <= state.best_val_loss:
+                torch.save(checkpoint, checkpoint_dir / "best.pt")
+            save_json(
+                run_dir / "metrics.json",
+                {
+                    "step": state.step,
+                    "best_val_loss": state.best_val_loss,
+                    "train_loss": state.train_loss,
+                    "val_loss": state.val_loss,
+                },
+            )
+
+    return run_dir
+
+
+def main() -> None:
+    config = parse_args()
+    run_dir = train(config)
+    print(f"Run directory: {run_dir}")
+
+
+if __name__ == "__main__":
+    main()
