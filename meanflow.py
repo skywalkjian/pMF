@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import einsum, nn
 from torch.utils.data import DataLoader
 from torchvision import transforms as T
-from torchvision.datasets import MNIST
+from torchvision.datasets import CIFAR10, MNIST
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
@@ -93,6 +93,10 @@ class TrainConfig:
     workdir: str = "./runs/mnist_meanflow"
     data_root: str = "./data"
     resume: str = ""
+    dataset: str = "mnist"
+    backbone: str = "unet"
+    variant: str = "meanflow"
+    optimizer: str = "adam"
     seed: int = 1024
     max_steps: int = 100000
     batch_size: int = 512
@@ -105,12 +109,16 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.99
     eps: float = 1e-8
+    weight_decay: float = 0.05
     grad_clip: float = 1.0
     model_dim: int = 32
     dim_mults: tuple[int, ...] = (1, 2, 4)
     convnext_mult: int = 2
-    channels: int = 1
-    image_size: int = 32
+    patch_size: int = 4
+    hidden_size: int = 256
+    depth: int = 8
+    num_heads: int = 4
+    mlp_ratio: float = 4.0
     t_min: float = 0.02
     p_mean: float = -0.4
     p_std: float = 1.0
@@ -125,6 +133,7 @@ class DatasetSpec:
     name: str
     channels: int
     image_size: int
+    num_classes: int
     mean: tuple[float, ...]
     std: tuple[float, ...]
 
@@ -353,6 +362,157 @@ class Unet(nn.Module):
         return self.final_conv(x)
 
 
+def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(half, device=timesteps.device, dtype=torch.float32) / max(half, 1))
+    args = timesteps.float()[:, None] * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = F.pad(embedding, (0, 1))
+    return embedding
+
+
+class ScalarConditionEmbed(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return self.mlp(timestep_embedding(values, self.hidden_size))
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, image_size: int, patch_size: int, channels: int, hidden_size: int):
+        super().__init__()
+        if image_size % patch_size != 0:
+            raise ValueError(f"image_size={image_size} must be divisible by patch_size={patch_size}")
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.channels = channels
+        self.hidden_size = hidden_size
+        self.grid_size = image_size // patch_size
+        self.num_patches = self.grid_size * self.grid_size
+        self.proj = nn.Conv2d(channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+
+class TransformerAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"hidden_size={hidden_size} must be divisible by num_heads={num_heads}")
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = x.shape
+        qkv = self.qkv(x).view(batch, tokens, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn = torch.matmul(q * self.scale, k.transpose(-1, -2))
+        attn = attn.softmax(dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch, tokens, self.hidden_size)
+        return self.proj(out)
+
+
+class TransformerMlp(nn.Module):
+    def __init__(self, hidden_size: int, mlp_ratio: float):
+        super().__init__()
+        inner_dim = int(hidden_size * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(hidden_size, inner_dim),
+            nn.GELU(),
+            nn.Linear(inner_dim, hidden_size),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.attn = TransformerAttention(hidden_size, num_heads)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.mlp = TransformerMlp(hidden_size, mlp_ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class MeanFlowTransformer(nn.Module):
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        channels: int,
+        hidden_size: int,
+        depth: int,
+        num_heads: int,
+        mlp_ratio: float,
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.channels = channels
+        self.hidden_size = hidden_size
+        self.patch_embed = PatchEmbed(image_size, patch_size, channels, hidden_size)
+        self.time_embed = ScalarConditionEmbed(hidden_size)
+        self.delta_embed = ScalarConditionEmbed(hidden_size)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, hidden_size))
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(hidden_size, num_heads, mlp_ratio) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+        self.head = nn.Linear(hidden_size, patch_size * patch_size * channels)
+        nn.init.normal_(self.pos_embed, std=0.02)
+
+    def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = patches.shape
+        grid_size = int(math.sqrt(tokens))
+        if grid_size * grid_size != tokens:
+            raise ValueError(f"Token count {tokens} is not a square grid.")
+        patches = patches.view(
+            batch,
+            grid_size,
+            grid_size,
+            self.patch_size,
+            self.patch_size,
+            self.channels,
+        )
+        patches = patches.permute(0, 5, 1, 3, 2, 4).contiguous()
+        return patches.view(batch, self.channels, self.image_size, self.image_size)
+
+    def forward(self, x: torch.Tensor, time: torch.Tensor, h: torch.Tensor | None = None) -> torch.Tensor:
+        tokens = self.patch_embed(x)
+        cond = self.time_embed(time)
+        if exists(h):
+            cond = cond + self.delta_embed(h)
+        tokens = tokens + self.pos_embed + cond[:, None, :]
+        for block in self.blocks:
+            tokens = block(tokens)
+        tokens = self.norm(tokens)
+        patches = self.head(tokens)
+        return self.unpatchify(patches)
+
+
 def build_meanflow_corruption(x0: torch.Tensor, eps: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
     return (1.0 - tau) * x0 + tau * eps
 
@@ -425,16 +585,36 @@ def generate_meanflow(model: nn.Module, noise_x: torch.Tensor) -> torch.Tensor:
     return noise_x - model(noise_x, tau, h)
 
 
-def get_dataset_spec() -> DatasetSpec:
-    return DatasetSpec(name="mnist", channels=1, image_size=32, mean=(0.5,), std=(0.5,))
+def get_dataset_spec(dataset_name: str) -> DatasetSpec:
+    if dataset_name == "mnist":
+        return DatasetSpec(name="mnist", channels=1, image_size=32, num_classes=10, mean=(0.5,), std=(0.5,))
+    if dataset_name == "cifar10":
+        return DatasetSpec(
+            name="cifar10",
+            channels=3,
+            image_size=32,
+            num_classes=10,
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+        )
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def build_datasets(config: TrainConfig):
-    spec = get_dataset_spec()
-    transform = T.Compose([T.ToTensor(), T.Pad(2), T.Normalize(spec.mean, spec.std)])
-    train_dataset = MNIST(config.data_root, train=True, transform=transform, download=True)
-    eval_dataset = MNIST(config.data_root, train=False, transform=transform, download=True)
-    return train_dataset, eval_dataset, spec
+    spec = get_dataset_spec(config.dataset)
+    if config.dataset == "mnist":
+        train_transform = T.Compose([T.ToTensor(), T.Pad(2), T.Normalize(spec.mean, spec.std)])
+        eval_transform = train_transform
+        train_dataset = MNIST(config.data_root, train=True, transform=train_transform, download=True)
+        eval_dataset = MNIST(config.data_root, train=False, transform=eval_transform, download=True)
+        return train_dataset, eval_dataset, spec
+    if config.dataset == "cifar10":
+        train_transform = T.Compose([T.RandomHorizontalFlip(), T.ToTensor(), T.Normalize(spec.mean, spec.std)])
+        eval_transform = T.Compose([T.ToTensor(), T.Normalize(spec.mean, spec.std)])
+        train_dataset = CIFAR10(config.data_root, train=True, transform=train_transform, download=True)
+        eval_dataset = CIFAR10(config.data_root, train=False, transform=eval_transform, download=True)
+        return train_dataset, eval_dataset, spec
+    raise ValueError(f"Unsupported dataset: {config.dataset}")
 
 
 def build_dataloader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed: int, drop_last: bool) -> DataLoader:
@@ -453,13 +633,39 @@ def build_dataloader(dataset, batch_size: int, shuffle: bool, num_workers: int, 
     )
 
 
-def build_model(config: TrainConfig) -> nn.Module:
-    return Unet(
-        dim=config.model_dim,
-        channels=config.channels,
-        dim_mults=tuple(config.dim_mults),
-        convnext_mult=config.convnext_mult,
-    )
+def build_model(config: TrainConfig, spec: DatasetSpec) -> nn.Module:
+    if config.backbone == "unet":
+        return Unet(
+            dim=config.model_dim,
+            channels=spec.channels,
+            dim_mults=tuple(config.dim_mults),
+            convnext_mult=config.convnext_mult,
+        )
+    if config.backbone == "transformer":
+        return MeanFlowTransformer(
+            image_size=spec.image_size,
+            patch_size=config.patch_size,
+            channels=spec.channels,
+            hidden_size=config.hidden_size,
+            depth=config.depth,
+            num_heads=config.num_heads,
+            mlp_ratio=config.mlp_ratio,
+        )
+    raise ValueError(f"Unsupported backbone: {config.backbone}")
+
+
+def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
+    if config.optimizer == "adam":
+        return torch.optim.Adam(model.parameters(), lr=config.lr, betas=(config.beta1, config.beta2), eps=config.eps)
+    if config.optimizer == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=config.lr,
+            betas=(config.beta1, config.beta2),
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+        )
+    raise ValueError(f"Unsupported optimizer: {config.optimizer}")
 
 
 def get_run_dir(config: TrainConfig) -> Path:
@@ -540,10 +746,14 @@ def restore_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optim
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train one-step MeanFlow on MNIST.")
+    parser = argparse.ArgumentParser(description="Train one-step MeanFlow baselines from meanflow.py.")
     parser.add_argument("--workdir", type=str, default="./runs/mnist_meanflow")
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--dataset", type=str, choices=["mnist", "cifar10"], default="mnist")
+    parser.add_argument("--backbone", type=str, choices=["unet", "transformer"], default="unet")
+    parser.add_argument("--variant", type=str, choices=["meanflow"], default="meanflow")
+    parser.add_argument("--optimizer", type=str, choices=["adam", "adamw"], default="adam")
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--max-steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -556,6 +766,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.99)
     parser.add_argument("--eps", type=float, default=1e-8)
+    parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--model-dim", type=int, default=32)
     parser.add_argument("--dim-mults", type=int, nargs="+", default=[1, 2, 4])
@@ -571,6 +782,10 @@ def parse_args() -> TrainConfig:
         workdir=args.workdir,
         data_root=args.data_root,
         resume=args.resume,
+        dataset=args.dataset,
+        backbone=args.backbone,
+        variant=args.variant,
+        optimizer=args.optimizer,
         seed=args.seed,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
@@ -583,6 +798,7 @@ def parse_args() -> TrainConfig:
         beta1=args.beta1,
         beta2=args.beta2,
         eps=args.eps,
+        weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         model_dim=args.model_dim,
         dim_mults=tuple(args.dim_mults),
@@ -611,8 +827,8 @@ def train(config: TrainConfig) -> Path:
     eval_loader = build_dataloader(eval_dataset, config.batch_size, False, config.num_workers, config.seed, False)
     train_iter = cycle(train_loader)
 
-    model = build_model(config).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, betas=(config.beta1, config.beta2), eps=config.eps)
+    model = build_model(config, spec).to(device)
+    optimizer = build_optimizer(model, config)
     loss_fn = MeanFlowLoss(
         p_mean=config.p_mean,
         p_std=config.p_std,
@@ -645,7 +861,10 @@ def train(config: TrainConfig) -> Path:
         device=device,
     )
 
-    progress = tqdm(range(state.step, config.max_steps), desc="Training MeanFlow-MNIST")
+    progress = tqdm(
+        range(state.step, config.max_steps),
+        desc=f"Training {config.variant}-{config.dataset}-{config.backbone}",
+    )
 
     for step in progress:
         images, _ = next(train_iter)
