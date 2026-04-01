@@ -517,6 +517,23 @@ def build_meanflow_corruption(x0: torch.Tensor, eps: torch.Tensor, tau: torch.Te
     return (1.0 - tau) * x0 + tau * eps
 
 
+def sample_time_from_noise(
+    shape: tuple[int, ...],
+    device: torch.device,
+    noise_dist: str,
+    p_mean: float,
+    p_std: float,
+    t_min: float,
+) -> torch.Tensor:
+    if noise_dist == "logit_normal":
+        raw = torch.sigmoid(torch.randn(shape, device=device) * p_std + p_mean)
+    elif noise_dist == "uniform":
+        raw = torch.rand(shape, device=device)
+    else:
+        raise ValueError(f"Unknown noise distribution: {noise_dist}")
+    return t_min + (1.0 - t_min) * raw
+
+
 class MeanFlowLoss:
     def __init__(
         self,
@@ -577,12 +594,73 @@ class MeanFlowLoss:
         return (err2 * adaptive_weight).mean()
 
 
+class PixelMeanFlowLoss:
+    def __init__(
+        self,
+        p_mean: float = -0.4,
+        p_std: float = 1.0,
+        noise_dist: str = "logit_normal",
+        t_min: float = 0.02,
+    ):
+        self.p_mean = p_mean
+        self.p_std = p_std
+        self.noise_dist = noise_dist
+        self.t_min = t_min
+
+    def sample_two_time(self, batch: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (batch, 1, 1, 1)
+        t = sample_time_from_noise(shape, device, self.noise_dist, self.p_mean, self.p_std, self.t_min)
+        r = torch.rand(shape, device=device) * t
+        return r, t
+
+    def __call__(self, net: nn.Module, images: torch.Tensor) -> torch.Tensor:
+        x0 = images
+        batch = x0.shape[0]
+        device = x0.device
+        r, t = self.sample_two_time(batch, device)
+        eps = torch.randn_like(x0)
+        z_t = build_meanflow_corruption(x0, eps, t)
+        v_target = eps - x0
+
+        def u_fn(z: torch.Tensor, r_val: torch.Tensor, t_val: torch.Tensor) -> torch.Tensor:
+            t_flat = t_val.view(batch)
+            h_flat = (t_val - r_val).view(batch)
+            x_pred = net(z, t_flat, h=h_flat)
+            return (z - x_pred) / t_val.clamp(min=self.t_min)
+
+        v_direction = u_fn(z_t, t, t).detach()
+        u, du_dt = torch.func.jvp(
+            u_fn,
+            (z_t, r, t),
+            (v_direction, torch.zeros_like(r), torch.ones_like(t)),
+        )
+        v_model = u + (t - r) * du_dt.detach()
+        return F.mse_loss(v_model, v_target)
+
+
 @torch.no_grad()
 def generate_meanflow(model: nn.Module, noise_x: torch.Tensor) -> torch.Tensor:
     batch = noise_x.shape[0]
     tau = torch.ones(batch, device=noise_x.device, dtype=noise_x.dtype)
     h = torch.ones_like(tau)
     return noise_x - model(noise_x, tau, h)
+
+
+@torch.no_grad()
+def generate_pmf(model: nn.Module, noise_x: torch.Tensor) -> torch.Tensor:
+    batch = noise_x.shape[0]
+    tau = torch.ones(batch, device=noise_x.device, dtype=noise_x.dtype)
+    h = torch.ones_like(tau)
+    return model(noise_x, tau, h)
+
+
+@torch.no_grad()
+def generate_samples(model: nn.Module, noise_x: torch.Tensor, variant: str) -> torch.Tensor:
+    if variant == "meanflow":
+        return generate_meanflow(model, noise_x)
+    if variant == "pmf":
+        return generate_pmf(model, noise_x)
+    raise ValueError(f"Unsupported variant: {variant}")
 
 
 def get_dataset_spec(dataset_name: str) -> DatasetSpec:
@@ -666,6 +744,26 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
             weight_decay=config.weight_decay,
         )
     raise ValueError(f"Unsupported optimizer: {config.optimizer}")
+
+
+def build_loss(config: TrainConfig):
+    if config.variant == "meanflow":
+        return MeanFlowLoss(
+            p_mean=config.p_mean,
+            p_std=config.p_std,
+            noise_dist=config.noise_dist,
+            norm_p=config.norm_p,
+            norm_eps=config.norm_eps,
+            t_min=config.t_min,
+        )
+    if config.variant == "pmf":
+        return PixelMeanFlowLoss(
+            p_mean=config.p_mean,
+            p_std=config.p_std,
+            noise_dist=config.noise_dist,
+            t_min=config.t_min,
+        )
+    raise ValueError(f"Unsupported variant: {config.variant}")
 
 
 def get_run_dir(config: TrainConfig) -> Path:
@@ -752,7 +850,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--dataset", type=str, choices=["mnist", "cifar10"], default="mnist")
     parser.add_argument("--backbone", type=str, choices=["unet", "transformer"], default="unet")
-    parser.add_argument("--variant", type=str, choices=["meanflow"], default="meanflow")
+    parser.add_argument("--variant", type=str, choices=["meanflow", "pmf"], default="meanflow")
     parser.add_argument("--optimizer", type=str, choices=["adam", "adamw"], default="adam")
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--max-steps", type=int, default=100000)
@@ -829,14 +927,7 @@ def train(config: TrainConfig) -> Path:
 
     model = build_model(config, spec).to(device)
     optimizer = build_optimizer(model, config)
-    loss_fn = MeanFlowLoss(
-        p_mean=config.p_mean,
-        p_std=config.p_std,
-        noise_dist=config.noise_dist,
-        norm_p=config.norm_p,
-        norm_eps=config.norm_eps,
-        t_min=config.t_min,
-    )
+    loss_fn = build_loss(config)
     state = RunState()
 
     if config.resume:
@@ -893,7 +984,7 @@ def train(config: TrainConfig) -> Path:
 
         if should_sample:
             with torch.no_grad():
-                samples = generate_meanflow(model, fixed_noise)
+                samples = generate_samples(model, fixed_noise, config.variant)
             save_sample_grid(samples, spec, sample_dir / f"step_{state.step:07d}.png")
 
         if should_save:
