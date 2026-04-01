@@ -99,6 +99,7 @@ class TrainConfig:
     backbone: str = "unet"
     variant: str = "meanflow"
     optimizer: str = "adamw"
+    attn_impl: str = "naive"
     seed: int = 1024
     max_steps: int = 100000
     batch_size: int = 512
@@ -410,7 +411,7 @@ class PatchEmbed(nn.Module):
 
 
 class TransformerAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, num_heads: int, attn_impl: str = "naive"):
         super().__init__()
         if hidden_size % num_heads != 0:
             raise ValueError(f"hidden_size={hidden_size} must be divisible by num_heads={num_heads}")
@@ -418,21 +419,24 @@ class TransformerAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim ** -0.5
+        self.attn_impl = attn_impl
         self.qkv = nn.Linear(hidden_size, hidden_size * 3)
         self.proj = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, prev_logits: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         batch, tokens, _ = x.shape
         qkv = self.qkv(x).view(batch, tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        attn = torch.matmul(q * self.scale, k.transpose(-1, -2))
-        attn = attn.softmax(dim=-1)
+        logits = torch.matmul(q * self.scale, k.transpose(-1, -2))
+        if self.attn_impl == "residual" and prev_logits is not None:
+            logits = logits + prev_logits
+        attn = logits.softmax(dim=-1)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.hidden_size)
-        return self.proj(out)
+        return self.proj(out), logits
 
 
 class TransformerMlp(nn.Module):
@@ -450,17 +454,19 @@ class TransformerMlp(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, attn_impl: str = "naive"):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
-        self.attn = TransformerAttention(hidden_size, num_heads)
+        self.attn = TransformerAttention(hidden_size, num_heads, attn_impl=attn_impl)
         self.norm2 = nn.LayerNorm(hidden_size)
         self.mlp = TransformerMlp(hidden_size, mlp_ratio)
+        self.attn_impl = attn_impl
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x: torch.Tensor, prev_logits: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        attn_out, logits = self.attn(self.norm1(x), prev_logits=prev_logits if self.attn_impl == "residual" else None)
+        x = x + attn_out
         x = x + self.mlp(self.norm2(x))
-        return x
+        return x, logits if self.attn_impl == "residual" else None
 
 
 class MeanFlowTransformer(nn.Module):
@@ -473,18 +479,20 @@ class MeanFlowTransformer(nn.Module):
         depth: int,
         num_heads: int,
         mlp_ratio: float,
+        attn_impl: str,
     ):
         super().__init__()
         self.image_size = image_size
         self.patch_size = patch_size
         self.channels = channels
         self.hidden_size = hidden_size
+        self.attn_impl = attn_impl
         self.patch_embed = PatchEmbed(image_size, patch_size, channels, hidden_size)
         self.time_embed = ScalarConditionEmbed(hidden_size)
         self.delta_embed = ScalarConditionEmbed(hidden_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, hidden_size))
         self.blocks = nn.ModuleList(
-            [TransformerBlock(hidden_size, num_heads, mlp_ratio) for _ in range(depth)]
+            [TransformerBlock(hidden_size, num_heads, mlp_ratio, attn_impl=attn_impl) for _ in range(depth)]
         )
         self.norm = nn.LayerNorm(hidden_size)
         self.head = nn.Linear(hidden_size, patch_size * patch_size * channels)
@@ -512,8 +520,9 @@ class MeanFlowTransformer(nn.Module):
         if exists(h):
             cond = cond + self.delta_embed(h)
         tokens = tokens + self.pos_embed + cond[:, None, :]
+        prev_logits = None
         for block in self.blocks:
-            tokens = block(tokens)
+            tokens, prev_logits = block(tokens, prev_logits=prev_logits)
         tokens = self.norm(tokens)
         patches = self.head(tokens)
         return self.unpatchify(patches)
@@ -734,6 +743,7 @@ def build_model(config: TrainConfig, spec: DatasetSpec) -> nn.Module:
             depth=config.depth,
             num_heads=config.num_heads,
             mlp_ratio=config.mlp_ratio,
+            attn_impl=config.attn_impl,
         )
     raise ValueError(f"Unsupported backbone: {config.backbone}")
 
@@ -900,6 +910,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--backbone", type=str, choices=["unet", "transformer"], default="unet")
     parser.add_argument("--variant", type=str, choices=["meanflow", "pmf"], default="meanflow")
     parser.add_argument("--optimizer", type=str, choices=["adam", "adamw", "muon"], default="adamw")
+    parser.add_argument("--attn-impl", type=str, choices=["naive", "residual"], default="naive")
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--max-steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -932,6 +943,7 @@ def parse_args() -> TrainConfig:
         backbone=args.backbone,
         variant=args.variant,
         optimizer=args.optimizer,
+        attn_impl=args.attn_impl,
         seed=args.seed,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
