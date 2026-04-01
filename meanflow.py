@@ -32,6 +32,8 @@ from torchvision.datasets import CIFAR10, MNIST
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
+from optim import SingleDeviceMuonWithAuxAdam
+
 
 def exists(x: Any) -> bool:
     return x is not None
@@ -96,7 +98,7 @@ class TrainConfig:
     dataset: str = "mnist"
     backbone: str = "unet"
     variant: str = "meanflow"
-    optimizer: str = "adam"
+    optimizer: str = "adamw"
     seed: int = 1024
     max_steps: int = 100000
     batch_size: int = 512
@@ -105,11 +107,15 @@ class TrainConfig:
     save_every: int = 5000
     num_workers: int = 2
     sample_batch_size: int = 16
-    lr: float = 1e-4
+    lr: float = 3e-4
     beta1: float = 0.9
-    beta2: float = 0.99
+    beta2: float = 0.95
     eps: float = 1e-8
     weight_decay: float = 0.05
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+    muon_nesterov: bool = True
     grad_clip: float = 1.0
     model_dim: int = 32
     dim_mults: tuple[int, ...] = (1, 2, 4)
@@ -743,6 +749,48 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
             eps=config.eps,
             weight_decay=config.weight_decay,
         )
+    if config.optimizer == "muon":
+        if config.variant != "pmf":
+            raise ValueError("Muon is only enabled for variant=pmf in this experiment chain.")
+        if not isinstance(model, MeanFlowTransformer):
+            raise ValueError("Muon is only supported for the transformer backbone in this experiment chain.")
+
+        muon_params = []
+        adamw_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("blocks.") and param.ndim >= 2 and not name.endswith("bias"):
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+
+        param_groups = []
+        if muon_params:
+            param_groups.append(
+                {
+                    "params": muon_params,
+                    "use_muon": True,
+                    "lr": config.muon_lr,
+                    "momentum": config.muon_momentum,
+                    "weight_decay": config.weight_decay,
+                    "ns_steps": config.muon_ns_steps,
+                    "nesterov": config.muon_nesterov,
+                }
+            )
+        if adamw_params:
+            param_groups.append(
+                {
+                    "params": adamw_params,
+                    "use_muon": False,
+                    "lr": config.lr,
+                    "betas": (config.beta1, config.beta2),
+                    "eps": config.eps,
+                    "weight_decay": config.weight_decay,
+                }
+            )
+
+        return SingleDeviceMuonWithAuxAdam(param_groups)
     raise ValueError(f"Unsupported optimizer: {config.optimizer}")
 
 
@@ -851,7 +899,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--dataset", type=str, choices=["mnist", "cifar10"], default="mnist")
     parser.add_argument("--backbone", type=str, choices=["unet", "transformer"], default="unet")
     parser.add_argument("--variant", type=str, choices=["meanflow", "pmf"], default="meanflow")
-    parser.add_argument("--optimizer", type=str, choices=["adam", "adamw"], default="adam")
+    parser.add_argument("--optimizer", type=str, choices=["adam", "adamw", "muon"], default="adamw")
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--max-steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -860,9 +908,9 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--sample-batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
-    parser.add_argument("--beta2", type=float, default=0.99)
+    parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
