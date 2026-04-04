@@ -108,6 +108,10 @@ class TrainConfig:
     save_every: int = 5000
     num_workers: int = 2
     sample_batch_size: int = 16
+    sample_steps: int = 1
+    sample_omega: float = 1.0
+    sample_t_min: float = 0.0
+    sample_t_max: float = 1.0
     lr: float = 3e-4
     beta1: float = 0.9
     beta2: float = 0.95
@@ -129,8 +133,14 @@ class TrainConfig:
     t_min: float = 0.02
     p_mean: float = -0.4
     p_std: float = 1.0
+    cfg_max: float = 7.0
+    cfg_beta: float = 1.0
+    class_dropout_prob: float = 0.1
+    data_proportion: float = 0.5
+    noise_scale: float = 1.0
+    tr_uniform: bool = False
     norm_p: float = 1.0
-    norm_eps: float = 1.0
+    norm_eps: float = 0.01
     noise_dist: str = "logit_normal"
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
@@ -393,6 +403,15 @@ class ScalarConditionEmbed(nn.Module):
         return self.mlp(timestep_embedding(values, self.hidden_size))
 
 
+class LabelConditionEmbed(nn.Module):
+    def __init__(self, num_classes: int, hidden_size: int):
+        super().__init__()
+        self.embedding = nn.Embedding(num_classes + 1, hidden_size)
+
+    def forward(self, labels: torch.Tensor) -> torch.Tensor:
+        return self.embedding(labels)
+
+
 class PatchEmbed(nn.Module):
     def __init__(self, image_size: int, patch_size: int, channels: int, hidden_size: int):
         super().__init__()
@@ -528,6 +547,138 @@ class MeanFlowTransformer(nn.Module):
         return self.unpatchify(patches)
 
 
+class PmfTransformer(nn.Module):
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        channels: int,
+        hidden_size: int,
+        depth: int,
+        num_heads: int,
+        mlp_ratio: float,
+        num_classes: int,
+        attn_impl: str,
+        noise_scale: float,
+    ):
+        super().__init__()
+        if depth < 3:
+            raise ValueError("pMF transformer depth must be at least 3 to split shared/u/v heads.")
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.channels = channels
+        self.hidden_size = hidden_size
+        self.num_classes = num_classes
+        self.null_label = num_classes
+        self.noise_scale = noise_scale
+        self.attn_impl = attn_impl
+
+        self.patch_embed = PatchEmbed(image_size, patch_size, channels, hidden_size)
+        self.h_embed = ScalarConditionEmbed(hidden_size)
+        self.omega_embed = ScalarConditionEmbed(hidden_size)
+        self.t_min_embed = ScalarConditionEmbed(hidden_size)
+        self.t_max_embed = ScalarConditionEmbed(hidden_size)
+        self.label_embed = LabelConditionEmbed(num_classes, hidden_size)
+
+        self.h_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.label_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.omega_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.t_min_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.t_max_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.prefix_tokens = 5
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches + self.prefix_tokens, hidden_size))
+
+        head_depth = max(1, depth // 2)
+        shared_depth = depth - head_depth
+        self.shared_blocks = nn.ModuleList(
+            [TransformerBlock(hidden_size, num_heads, mlp_ratio, attn_impl=attn_impl) for _ in range(shared_depth)]
+        )
+        self.u_heads = nn.ModuleList(
+            [TransformerBlock(hidden_size, num_heads, mlp_ratio, attn_impl=attn_impl) for _ in range(head_depth)]
+        )
+        self.v_heads = nn.ModuleList(
+            [TransformerBlock(hidden_size, num_heads, mlp_ratio, attn_impl=attn_impl) for _ in range(head_depth)]
+        )
+        self.u_norm = nn.LayerNorm(hidden_size)
+        self.v_norm = nn.LayerNorm(hidden_size)
+        self.u_head = nn.Linear(hidden_size, patch_size * patch_size * channels)
+        self.v_head = nn.Linear(hidden_size, patch_size * patch_size * channels)
+
+        for token in (self.h_token, self.label_token, self.omega_token, self.t_min_token, self.t_max_token, self.pos_embed):
+            nn.init.normal_(token, std=0.02)
+
+    def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = patches.shape
+        grid_size = int(math.sqrt(tokens))
+        if grid_size * grid_size != tokens:
+            raise ValueError(f"Token count {tokens} is not a square grid.")
+        patches = patches.view(
+            batch,
+            grid_size,
+            grid_size,
+            self.patch_size,
+            self.patch_size,
+            self.channels,
+        )
+        patches = patches.permute(0, 5, 1, 3, 2, 4).contiguous()
+        return patches.view(batch, self.channels, self.image_size, self.image_size)
+
+    def build_sequence(
+        self,
+        x: torch.Tensor,
+        h: torch.Tensor,
+        omega: torch.Tensor,
+        t_min: torch.Tensor,
+        t_max: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        batch = x.shape[0]
+        image_tokens = self.patch_embed(x)
+        label_token = self.label_token + self.label_embed(labels).view(batch, 1, self.hidden_size)
+        omega_values = (1.0 - 1.0 / omega.clamp(min=1.0)).view(batch)
+        omega_token = self.omega_token + self.omega_embed(omega_values).view(batch, 1, self.hidden_size)
+        t_min_token = self.t_min_token + self.t_min_embed(t_min.view(batch)).view(batch, 1, self.hidden_size)
+        t_max_token = self.t_max_token + self.t_max_embed(t_max.view(batch)).view(batch, 1, self.hidden_size)
+        h_token = self.h_token + self.h_embed(h.view(batch)).view(batch, 1, self.hidden_size)
+        prefix = torch.cat([label_token, omega_token, t_min_token, t_max_token, h_token], dim=1)
+        return torch.cat([prefix, image_tokens], dim=1) + self.pos_embed
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time: torch.Tensor,
+        h: torch.Tensor,
+        omega: torch.Tensor,
+        t_min: torch.Tensor,
+        t_max: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens = self.build_sequence(x, h, omega, t_min, t_max, labels)
+        prev_logits = None
+        for block in self.shared_blocks:
+            tokens, prev_logits = block(tokens, prev_logits=prev_logits)
+
+        u_tokens = tokens
+        u_logits = prev_logits
+        for block in self.u_heads:
+            u_tokens, u_logits = block(u_tokens, prev_logits=u_logits)
+
+        v_tokens = tokens
+        v_logits = prev_logits
+        for block in self.v_heads:
+            v_tokens, v_logits = block(v_tokens, prev_logits=v_logits)
+
+        u_tokens = self.u_norm(u_tokens[:, self.prefix_tokens :])
+        v_tokens = self.v_norm(v_tokens[:, self.prefix_tokens :])
+        u_pixels = self.unpatchify(self.u_head(u_tokens))
+        v_pixels = self.unpatchify(self.v_head(v_tokens))
+
+        time = time.view(x.shape[0], 1, 1, 1)
+        u = (x - u_pixels) / time.clamp(min=0.05)
+        v = (x - v_pixels) / time.clamp(min=0.05)
+        return u, v
+
+
 def build_meanflow_corruption(x0: torch.Tensor, eps: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
     return (1.0 - tau) * x0 + tau * eps
 
@@ -574,7 +725,7 @@ class MeanFlowLoss:
             return torch.rand(shape, device=device)
         raise ValueError(f"Unknown noise distribution: {self.noise_dist}")
 
-    def __call__(self, net: nn.Module, images: torch.Tensor) -> torch.Tensor:
+    def __call__(self, net: nn.Module, images: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
         x0 = images
         batch = x0.shape[0]
         device = x0.device
@@ -615,42 +766,181 @@ class PixelMeanFlowLoss:
         p_mean: float = -0.4,
         p_std: float = 1.0,
         noise_dist: str = "logit_normal",
-        t_min: float = 0.02,
+        cfg_max: float = 7.0,
+        cfg_beta: float = 1.0,
+        class_dropout_prob: float = 0.1,
+        data_proportion: float = 0.5,
+        noise_scale: float = 1.0,
+        tr_uniform: bool = False,
+        norm_p: float = 1.0,
+        norm_eps: float = 0.01,
     ):
         self.p_mean = p_mean
         self.p_std = p_std
         self.noise_dist = noise_dist
-        self.t_min = t_min
+        self.cfg_max = cfg_max
+        self.cfg_beta = cfg_beta
+        self.class_dropout_prob = class_dropout_prob
+        self.data_proportion = data_proportion
+        self.noise_scale = noise_scale
+        self.tr_uniform = tr_uniform
+        self.norm_p = norm_p
+        self.norm_eps = norm_eps
 
-    def sample_two_time(self, batch: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def noise_distribution(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        if self.noise_dist == "logit_normal":
+            rnd_normal = torch.randn(shape, device=device)
+            return torch.sigmoid(rnd_normal * self.p_std + self.p_mean)
+        if self.noise_dist == "uniform":
+            return torch.rand(shape, device=device)
+        raise ValueError(f"Unknown noise distribution: {self.noise_dist}")
+
+    def sample_tr(self, batch: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         shape = (batch, 1, 1, 1)
-        t = sample_time_from_noise(shape, device, self.noise_dist, self.p_mean, self.p_std, self.t_min)
-        r = torch.rand(shape, device=device) * t
-        return r, t
+        t = self.noise_distribution(shape, device)
+        r = self.noise_distribution(shape, device)
+        if self.tr_uniform:
+            uniform_mask = torch.rand(shape, device=device) < 0.1
+            t = torch.where(uniform_mask, torch.rand(shape, device=device), t)
+            r = torch.where(uniform_mask, torch.rand(shape, device=device), r)
+        data_size = int(batch * self.data_proportion)
+        fm_mask = torch.arange(batch, device=device).view(batch, 1, 1, 1) < data_size
+        r = torch.where(fm_mask, t, r)
+        t, r = torch.maximum(t, r), torch.minimum(t, r)
+        return t, r, fm_mask
 
-    def __call__(self, net: nn.Module, images: torch.Tensor) -> torch.Tensor:
-        x0 = images
-        batch = x0.shape[0]
-        device = x0.device
-        r, t = self.sample_two_time(batch, device)
-        eps = torch.randn_like(x0)
-        z_t = build_meanflow_corruption(x0, eps, t)
-        v_target = eps - x0
+    def sample_cfg_scale(self, batch: int, device: torch.device) -> torch.Tensor:
+        u = torch.rand((batch, 1, 1, 1), device=device, dtype=torch.float32)
+        if self.cfg_beta == 1.0:
+            return torch.exp(u * torch.log1p(torch.tensor(self.cfg_max, device=device, dtype=torch.float32)))
+        smax = torch.tensor(self.cfg_max, device=device, dtype=torch.float32)
+        beta = torch.tensor(self.cfg_beta, device=device, dtype=torch.float32)
+        log_base = (1.0 - beta) * torch.log1p(smax)
+        log_inner = torch.log1p(u * torch.expm1(log_base))
+        return torch.exp(log_inner / (1.0 - beta))
 
-        def u_fn(z: torch.Tensor, r_val: torch.Tensor, t_val: torch.Tensor) -> torch.Tensor:
-            t_flat = t_val.view(batch)
-            h_flat = (t_val - r_val).view(batch)
-            x_pred = net(z, t_flat, h=h_flat)
-            return (z - x_pred) / t_val.clamp(min=self.t_min)
+    def sample_cfg_interval(self, batch: int, device: torch.device, fm_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        t_min = torch.rand((batch, 1, 1, 1), device=device) * 0.5
+        t_max = 0.5 + torch.rand((batch, 1, 1, 1), device=device) * 0.5
+        t_min = torch.where(fm_mask, torch.zeros_like(t_min), t_min)
+        t_max = torch.where(fm_mask, torch.ones_like(t_max), t_max)
+        return t_min, t_max
 
-        v_direction = u_fn(z_t, t, t).detach()
-        u, du_dt = torch.func.jvp(
-            u_fn,
-            (z_t, r, t),
-            (v_direction, torch.zeros_like(r), torch.ones_like(t)),
+    def v_cond_fn(
+        self,
+        net: PmfTransformer,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        omega: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        zeros = torch.zeros_like(t)
+        ones = torch.ones_like(t)
+        _, v = net(
+            z_t,
+            t.view(z_t.shape[0]),
+            zeros.view(z_t.shape[0]),
+            omega.view(z_t.shape[0]),
+            zeros.view(z_t.shape[0]),
+            ones.view(z_t.shape[0]),
+            labels,
         )
-        v_model = u + (t - r) * du_dt.detach()
-        return F.mse_loss(v_model, v_target)
+        return v
+
+    def v_fn(
+        self,
+        net: PmfTransformer,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        omega: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = z_t.shape[0]
+        z_dual = torch.cat([z_t, z_t], dim=0)
+        t_dual = torch.cat([t, t], dim=0)
+        omega_dual = torch.cat([omega, torch.ones_like(omega)], dim=0)
+        labels_dual = torch.cat(
+            [labels, torch.full_like(labels, net.null_label)],
+            dim=0,
+        )
+        v = self.v_cond_fn(net, z_dual, t_dual, omega_dual, labels_dual)
+        return v[:batch], v[batch:]
+
+    def guidance_fn(
+        self,
+        net: PmfTransformer,
+        v_t: torch.Tensor,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        labels: torch.Tensor,
+        fm_mask: torch.Tensor,
+        omega: torch.Tensor,
+        t_min: torch.Tensor,
+        t_max: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del r
+        v_c, v_u = self.v_fn(net, z_t, t, omega, labels)
+        v_g_fm = v_t + (1.0 - 1.0 / omega) * (v_c - v_u)
+        interval_mask = (t >= t_min) & (t <= t_max)
+        omega_interval = torch.where(interval_mask, omega, torch.ones_like(omega))
+        v_c_interval = self.v_cond_fn(net, z_t, t, omega_interval, labels)
+        v_g = v_t + (1.0 - 1.0 / omega_interval) * (v_c_interval - v_u)
+        v_g = torch.where(fm_mask, v_g_fm, v_g)
+        return v_g, v_c_interval
+
+    def cond_drop(
+        self,
+        net: PmfTransformer,
+        v_t: torch.Tensor,
+        v_g: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        drop_mask = torch.rand(labels.shape[0], device=labels.device) < self.class_dropout_prob
+        labels = torch.where(drop_mask, torch.full_like(labels, net.null_label), labels)
+        v_g = torch.where(drop_mask.view(-1, 1, 1, 1), v_t, v_g)
+        return labels, v_g
+
+    def adaptive_weight(self, loss: torch.Tensor) -> torch.Tensor:
+        adp_wt = (loss + self.norm_eps) ** self.norm_p
+        return loss / adp_wt.detach()
+
+    def __call__(self, net: PmfTransformer, images: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
+        if labels is None:
+            raise ValueError("pMF training requires labels for class conditioning.")
+        x = images
+        batch = x.shape[0]
+        device = x.device
+        t, r, fm_mask = self.sample_tr(batch, device)
+        eps = torch.randn_like(x) * self.noise_scale
+        z_t = build_meanflow_corruption(x, eps, t)
+        v_t = (z_t - x) / t.clamp(min=0.05)
+        t_min, t_max = self.sample_cfg_interval(batch, device, fm_mask)
+        omega = self.sample_cfg_scale(batch, device).to(x.dtype)
+        v_g, v_c = self.guidance_fn(net, v_t, z_t, t, r, labels, fm_mask, omega, t_min, t_max)
+        labels, v_g = self.cond_drop(net, v_t, v_g, labels)
+
+        def warped_u_fn(z_in: torch.Tensor, t_in: torch.Tensor, r_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return net(
+                z_in,
+                t_in.view(batch),
+                (t_in - r_in).view(batch),
+                omega.view(batch),
+                t_min.view(batch),
+                t_max.view(batch),
+                labels,
+            )
+
+        (u, v), (du_dt, _) = torch.func.jvp(
+            warped_u_fn,
+            (z_t, t, r),
+            (v_c, torch.ones_like(t), torch.zeros_like(r)),
+        )
+        v_compound = u + (t - r) * du_dt.detach()
+        v_g = v_g.detach()
+        loss_u = (v_compound - v_g).square().mean(dim=(1, 2, 3))
+        loss_v = (v - v_g).square().mean(dim=(1, 2, 3))
+        return (self.adaptive_weight(loss_u) + self.adaptive_weight(loss_v)).mean()
 
 
 @torch.no_grad()
@@ -661,20 +951,55 @@ def generate_meanflow(model: nn.Module, noise_x: torch.Tensor) -> torch.Tensor:
     return noise_x - model(noise_x, tau, h)
 
 
-@torch.no_grad()
-def generate_pmf(model: nn.Module, noise_x: torch.Tensor) -> torch.Tensor:
-    batch = noise_x.shape[0]
-    tau = torch.ones(batch, device=noise_x.device, dtype=noise_x.dtype)
-    h = torch.ones_like(tau)
-    return model(noise_x, tau, h)
+def build_sample_labels(num_classes: int, batch_size: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(batch_size, device=device, dtype=torch.long) % num_classes
 
 
 @torch.no_grad()
-def generate_samples(model: nn.Module, noise_x: torch.Tensor, variant: str) -> torch.Tensor:
+def generate_pmf(
+    model: PmfTransformer,
+    noise_x: torch.Tensor,
+    labels: torch.Tensor,
+    sample_steps: int,
+    sample_omega: float,
+    sample_t_min: float,
+    sample_t_max: float,
+) -> torch.Tensor:
+    z_t = noise_x * model.noise_scale
+    t_steps = torch.linspace(1.0, 0.0, sample_steps + 1, device=noise_x.device, dtype=noise_x.dtype)
+    for step in range(sample_steps):
+        t = t_steps[step].expand(z_t.shape[0])
+        r = t_steps[step + 1].expand(z_t.shape[0])
+        omega = torch.full_like(t, sample_omega)
+        t_min = torch.full_like(t, sample_t_min)
+        t_max = torch.full_like(t, sample_t_max)
+        u, _ = model(z_t, t, t - r, omega, t_min, t_max, labels)
+        z_t = z_t - (t - r).view(-1, 1, 1, 1) * u
+    return z_t
+
+
+@torch.no_grad()
+def generate_samples(
+    model: nn.Module,
+    noise_x: torch.Tensor,
+    variant: str,
+    labels: torch.Tensor | None = None,
+    config: TrainConfig | None = None,
+) -> torch.Tensor:
     if variant == "meanflow":
         return generate_meanflow(model, noise_x)
     if variant == "pmf":
-        return generate_pmf(model, noise_x)
+        if labels is None or config is None:
+            raise ValueError("pMF sample generation requires labels and config.")
+        return generate_pmf(
+            model,
+            noise_x,
+            labels,
+            config.sample_steps,
+            config.sample_omega,
+            config.sample_t_min,
+            config.sample_t_max,
+        )
     raise ValueError(f"Unsupported variant: {variant}")
 
 
@@ -727,6 +1052,21 @@ def build_dataloader(dataset, batch_size: int, shuffle: bool, num_workers: int, 
 
 
 def build_model(config: TrainConfig, spec: DatasetSpec) -> nn.Module:
+    if config.variant == "pmf":
+        if config.backbone != "transformer":
+            raise ValueError("pMF is only supported with the transformer backbone after the JAX-aligned rewrite.")
+        return PmfTransformer(
+            image_size=spec.image_size,
+            patch_size=config.patch_size,
+            channels=spec.channels,
+            hidden_size=config.hidden_size,
+            depth=config.depth,
+            num_heads=config.num_heads,
+            mlp_ratio=config.mlp_ratio,
+            num_classes=spec.num_classes,
+            attn_impl=config.attn_impl,
+            noise_scale=config.noise_scale,
+        )
     if config.backbone == "unet":
         return Unet(
             dim=config.model_dim,
@@ -762,7 +1102,7 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
     if config.optimizer == "muon":
         if config.variant != "pmf":
             raise ValueError("Muon is only enabled for variant=pmf in this experiment chain.")
-        if not isinstance(model, MeanFlowTransformer):
+        if not isinstance(model, PmfTransformer):
             raise ValueError("Muon is only supported for the transformer backbone in this experiment chain.")
 
         muon_params = []
@@ -770,7 +1110,7 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name.startswith("blocks.") and param.ndim >= 2 and not name.endswith("bias"):
+            if name.startswith(("shared_blocks.", "u_heads.", "v_heads.")) and param.ndim >= 2 and not name.endswith("bias"):
                 muon_params.append(param)
             else:
                 adamw_params.append(param)
@@ -819,7 +1159,14 @@ def build_loss(config: TrainConfig):
             p_mean=config.p_mean,
             p_std=config.p_std,
             noise_dist=config.noise_dist,
-            t_min=config.t_min,
+            cfg_max=config.cfg_max,
+            cfg_beta=config.cfg_beta,
+            class_dropout_prob=config.class_dropout_prob,
+            data_proportion=config.data_proportion,
+            noise_scale=config.noise_scale,
+            tr_uniform=config.tr_uniform,
+            norm_p=config.norm_p,
+            norm_eps=config.norm_eps,
         )
     raise ValueError(f"Unsupported variant: {config.variant}")
 
@@ -846,14 +1193,14 @@ def save_sample_grid(samples: torch.Tensor, spec: DatasetSpec, path: Path) -> No
     save_image(grid, path)
 
 
-def evaluate_meanflow(model: nn.Module, loss_fn: MeanFlowLoss, loader: DataLoader, device: torch.device, num_batches: int = 5) -> float:
+def evaluate_loss(model: nn.Module, loss_fn, loader: DataLoader, device: torch.device, num_batches: int = 5) -> float:
     model.eval()
     losses = []
     iterator = iter(loader)
     with torch.no_grad():
         for _ in range(min(num_batches, len(loader))):
-            images, _ = next(iterator)
-            losses.append(loss_fn(model, images.to(device)).item())
+            images, labels = next(iterator)
+            losses.append(loss_fn(model, images.to(device), labels.to(device)).item())
     model.train()
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -885,7 +1232,15 @@ def make_checkpoint(
 
 def restore_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> RunState:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model"])
+    try:
+        model.load_state_dict(checkpoint["model"])
+    except RuntimeError as exc:
+        if checkpoint.get("config", {}).get("variant") == "pmf":
+            raise RuntimeError(
+                "This pMF checkpoint predates the JAX-aligned pMF rewrite and is no longer compatible. "
+                "Please retrain pMF experiments from scratch."
+            ) from exc
+        raise
     optimizer.load_state_dict(checkpoint["optimizer"])
     torch.random.set_rng_state(checkpoint["rng_state"]["torch"])
     np.random.set_state(checkpoint["rng_state"]["numpy"])
@@ -919,6 +1274,10 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--sample-batch-size", type=int, default=16)
+    parser.add_argument("--sample-steps", type=int, default=1)
+    parser.add_argument("--sample-omega", type=float, default=1.0)
+    parser.add_argument("--sample-t-min", type=float, default=0.0)
+    parser.add_argument("--sample-t-max", type=float, default=1.0)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
@@ -931,8 +1290,14 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--t-min", type=float, default=0.02)
     parser.add_argument("--p-mean", type=float, default=-0.4)
     parser.add_argument("--p-std", type=float, default=1.0)
+    parser.add_argument("--cfg-max", type=float, default=7.0)
+    parser.add_argument("--cfg-beta", type=float, default=1.0)
+    parser.add_argument("--class-dropout-prob", type=float, default=0.1)
+    parser.add_argument("--data-proportion", type=float, default=0.5)
+    parser.add_argument("--noise-scale", type=float, default=1.0)
+    parser.add_argument("--tr-uniform", action="store_true")
     parser.add_argument("--norm-p", type=float, default=1.0)
-    parser.add_argument("--norm-eps", type=float, default=1.0)
+    parser.add_argument("--norm-eps", type=float, default=0.01)
     parser.add_argument("--noise-dist", type=str, choices=["logit_normal", "uniform"], default="logit_normal")
     args = parser.parse_args()
     return TrainConfig(
@@ -952,6 +1317,10 @@ def parse_args() -> TrainConfig:
         save_every=args.save_every,
         num_workers=args.num_workers,
         sample_batch_size=args.sample_batch_size,
+        sample_steps=args.sample_steps,
+        sample_omega=args.sample_omega,
+        sample_t_min=args.sample_t_min,
+        sample_t_max=args.sample_t_max,
         lr=args.lr,
         beta1=args.beta1,
         beta2=args.beta2,
@@ -964,6 +1333,12 @@ def parse_args() -> TrainConfig:
         t_min=args.t_min,
         p_mean=args.p_mean,
         p_std=args.p_std,
+        cfg_max=args.cfg_max,
+        cfg_beta=args.cfg_beta,
+        class_dropout_prob=args.class_dropout_prob,
+        data_proportion=args.data_proportion,
+        noise_scale=args.noise_scale,
+        tr_uniform=args.tr_uniform,
         norm_p=args.norm_p,
         norm_eps=args.norm_eps,
         noise_dist=args.noise_dist,
@@ -1011,6 +1386,7 @@ def train(config: TrainConfig) -> Path:
         generator=sample_generator,
         device=device,
     )
+    fixed_labels = build_sample_labels(spec.num_classes, config.sample_batch_size, device) if config.variant == "pmf" else None
 
     progress = tqdm(
         range(state.step, config.max_steps),
@@ -1018,10 +1394,11 @@ def train(config: TrainConfig) -> Path:
     )
 
     for step in progress:
-        images, _ = next(train_iter)
+        images, labels = next(train_iter)
         images = images.to(device, non_blocking=torch.cuda.is_available())
+        labels = labels.to(device, non_blocking=torch.cuda.is_available(), dtype=torch.long)
 
-        loss = loss_fn(model, images)
+        loss = loss_fn(model, images, labels)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -1037,14 +1414,14 @@ def train(config: TrainConfig) -> Path:
         should_save = state.step % config.save_every == 0 or state.step == config.max_steps
 
         if should_eval:
-            val_loss = evaluate_meanflow(model, loss_fn, eval_loader, device)
+            val_loss = evaluate_loss(model, loss_fn, eval_loader, device)
             state.val_loss.append(val_loss)
             state.best_val_loss = min(state.best_val_loss, val_loss)
             progress.set_postfix(loss=f"{loss.item():.2e}", avg=f"{avg_loss:.2e}", val=f"{val_loss:.2e}", best=f"{state.best_val_loss:.2e}")
 
         if should_sample:
             with torch.no_grad():
-                samples = generate_samples(model, fixed_noise, config.variant)
+                samples = generate_samples(model, fixed_noise, config.variant, labels=fixed_labels, config=config)
             save_sample_grid(samples, spec, sample_dir / f"step_{state.step:07d}.png")
 
         if should_save:
