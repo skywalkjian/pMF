@@ -103,6 +103,7 @@ class TrainConfig:
     seed: int = 1024
     max_steps: int = 100000
     batch_size: int = 512
+    grad_accum_steps: int = 1
     eval_every: int = 5000
     sample_every: int = 5000
     save_every: int = 5000
@@ -442,15 +443,24 @@ class TransformerAttention(nn.Module):
         self.qkv = nn.Linear(hidden_size, hidden_size * 3)
         self.proj = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, x: torch.Tensor, prev_logits: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, prev_logits: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, tokens, _ = x.shape
         qkv = self.qkv(x).view(batch, tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        if self.attn_impl == "naive":
+            # Let PyTorch dispatch to the fused SDPA kernel when it supports the
+            # current autograd mode; fall back to the explicit implementation for JVP.
+            try:
+                out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+                out = out.transpose(1, 2).contiguous().view(batch, tokens, self.hidden_size)
+                return self.proj(out), None
+            except NotImplementedError:
+                pass
         logits = torch.matmul(q * self.scale, k.transpose(-1, -2))
-        if self.attn_impl == "residual" and prev_logits is not None:
+        if prev_logits is not None:
             logits = logits + prev_logits
         attn = logits.softmax(dim=-1)
         out = torch.matmul(attn, v)
@@ -1269,6 +1279,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--max-steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--sample-every", type=int, default=5000)
     parser.add_argument("--save-every", type=int, default=5000)
@@ -1287,6 +1298,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--model-dim", type=int, default=32)
     parser.add_argument("--dim-mults", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--convnext-mult", type=int, default=2)
+    parser.add_argument("--patch-size", type=int, default=4)
+    parser.add_argument("--hidden-size", type=int, default=256)
+    parser.add_argument("--depth", type=int, default=8)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--t-min", type=float, default=0.02)
     parser.add_argument("--p-mean", type=float, default=-0.4)
     parser.add_argument("--p-std", type=float, default=1.0)
@@ -1299,6 +1315,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--norm-p", type=float, default=1.0)
     parser.add_argument("--norm-eps", type=float, default=0.01)
     parser.add_argument("--noise-dist", type=str, choices=["logit_normal", "uniform"], default="logit_normal")
+    parser.add_argument("--device", type=str, default="")
     args = parser.parse_args()
     return TrainConfig(
         workdir=args.workdir,
@@ -1312,6 +1329,7 @@ def parse_args() -> TrainConfig:
         seed=args.seed,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
         eval_every=args.eval_every,
         sample_every=args.sample_every,
         save_every=args.save_every,
@@ -1330,6 +1348,11 @@ def parse_args() -> TrainConfig:
         model_dim=args.model_dim,
         dim_mults=tuple(args.dim_mults),
         convnext_mult=args.convnext_mult,
+        patch_size=args.patch_size,
+        hidden_size=args.hidden_size,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
         t_min=args.t_min,
         p_mean=args.p_mean,
         p_std=args.p_std,
@@ -1342,10 +1365,13 @@ def parse_args() -> TrainConfig:
         norm_p=args.norm_p,
         norm_eps=args.norm_eps,
         noise_dist=args.noise_dist,
+        device=args.device or TrainConfig().device,
     )
 
 
 def train(config: TrainConfig) -> Path:
+    if config.grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1.")
     set_seed(config.seed)
     device = torch.device(config.device)
     run_dir = get_run_dir(config)
@@ -1394,20 +1420,26 @@ def train(config: TrainConfig) -> Path:
     )
 
     for step in progress:
-        images, labels = next(train_iter)
-        images = images.to(device, non_blocking=torch.cuda.is_available())
-        labels = labels.to(device, non_blocking=torch.cuda.is_available(), dtype=torch.long)
-
-        loss = loss_fn(model, images, labels)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        microbatch_losses = []
+
+        for _ in range(config.grad_accum_steps):
+            images, labels = next(train_iter)
+            images = images.to(device, non_blocking=torch.cuda.is_available())
+            labels = labels.to(device, non_blocking=torch.cuda.is_available(), dtype=torch.long)
+
+            loss = loss_fn(model, images, labels)
+            microbatch_losses.append(float(loss.item()))
+            (loss / config.grad_accum_steps).backward()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         optimizer.step()
 
         state.step = step + 1
-        state.train_loss.append(float(loss.item()))
+        step_loss = float(np.mean(microbatch_losses))
+        state.train_loss.append(step_loss)
         avg_loss = float(np.mean(state.train_loss[-min(100, len(state.train_loss)) :]))
-        progress.set_postfix(loss=f"{loss.item():.2e}", avg=f"{avg_loss:.2e}", best=f"{state.best_val_loss:.2e}" if np.isfinite(state.best_val_loss) else "N/A")
+        progress.set_postfix(loss=f"{step_loss:.2e}", avg=f"{avg_loss:.2e}", best=f"{state.best_val_loss:.2e}" if np.isfinite(state.best_val_loss) else "N/A")
 
         should_eval = state.step % config.eval_every == 0 or state.step == config.max_steps
         should_sample = state.step % config.sample_every == 0 or state.step == config.max_steps
@@ -1417,7 +1449,7 @@ def train(config: TrainConfig) -> Path:
             val_loss = evaluate_loss(model, loss_fn, eval_loader, device)
             state.val_loss.append(val_loss)
             state.best_val_loss = min(state.best_val_loss, val_loss)
-            progress.set_postfix(loss=f"{loss.item():.2e}", avg=f"{avg_loss:.2e}", val=f"{val_loss:.2e}", best=f"{state.best_val_loss:.2e}")
+            progress.set_postfix(loss=f"{step_loss:.2e}", avg=f"{avg_loss:.2e}", val=f"{val_loss:.2e}", best=f"{state.best_val_loss:.2e}")
 
         if should_sample:
             with torch.no_grad():

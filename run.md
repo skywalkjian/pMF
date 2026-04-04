@@ -1,19 +1,26 @@
 # 实验运行指南
 
-训练入口只有一个：
+进入目录：
+
+```bash
+cd pMF
+pip install -r requirements.txt
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+训练入口：
 
 ```bash
 python meanflow.py ...
 ```
 
-先进入项目目录并安装依赖：
+FID 入口：
 
 ```bash
-cd pMF
-pip install -r requirements.txt
+python fid_eval.py ...
 ```
 
-数据会自动下载到 `./data`。每次运行都会在 `--workdir` 下生成一个时间戳目录，里面有：
+每次训练会在 `--workdir/<timestamp>/` 下生成：
 
 - `config.json`
 - `metrics.json`
@@ -22,103 +29,50 @@ pip install -r requirements.txt
 
 ## 1. 先跑 smoke
 
-先确认训练、采样、checkpoint 都正常。
-
-### MeanFlow baseline smoke
-
 ```bash
 python meanflow.py \
-  --workdir ./runs/smoke_meanflow_mnist \
-  --dataset mnist \
-  --backbone unet \
-  --variant meanflow \
-  --optimizer adam \
-  --max-steps 20 \
-  --batch-size 64 \
-  --eval-every 20 \
-  --sample-every 20 \
-  --save-every 20 \
-  --num-workers 0
-```
-
-### pMF smoke
-
-```bash
-python meanflow.py \
-  --workdir ./runs/smoke_pmf_mnist \
-  --dataset mnist \
+  --workdir ./runs/smoke_pmf_cifar10 \
+  --dataset cifar10 \
   --backbone transformer \
   --variant pmf \
   --optimizer adamw \
   --attn-impl naive \
   --max-steps 20 \
-  --batch-size 64 \
+  --batch-size 8 \
+  --grad-accum-steps 2 \
   --eval-every 20 \
   --sample-every 20 \
   --save-every 20 \
+  --sample-batch-size 4 \
   --num-workers 0
 ```
 
-## 2. 正式实验
+## 2. 三组 CIFAR10 主实验
 
-## 2.1 MeanFlow baseline
+统一原则：
 
-这是旧 baseline，对照用。
-
-```bash
-python meanflow.py \
-  --workdir ./runs/mnist_meanflow_baseline \
-  --dataset mnist \
-  --backbone unet \
-  --variant meanflow \
-  --optimizer adamw \
-  --max-steps 5000 \
-  --batch-size 256 \
-  --eval-every 250 \
-  --sample-every 500 \
-  --save-every 500 \
-  --num-workers 4
-```
-
-## 2.2 MNIST 上的 pMF
-
-这是修复后的 pMF 验证实验。
-
-```bash
-python meanflow.py \
-  --workdir ./runs/mnist_pmf_transformer_naive \
-  --dataset mnist \
-  --backbone transformer \
-  --variant pmf \
-  --optimizer adamw \
-  --attn-impl naive \
-  --max-steps 5000 \
-  --batch-size 256 \
-  --eval-every 250 \
-  --sample-every 500 \
-  --save-every 500 \
-  --num-workers 4
-```
-
-## 2.3 CIFAR10 主实验
-
-这是当前最重要的三组。
+- 三组实验保持同一套 micro-batch、`grad_accum_steps`、transformer 超参
+- 当前默认先用 `batch_size=32 + grad_accum_steps=8`
+- 这相当于 effective batch 约 `256`
+- 如果仍然 OOM，再把三组一起降到 `batch_size=16 + grad_accum_steps=16`
 
 ### pMF + AdamW + naive
 
 ```bash
 python meanflow.py \
-  --workdir ./runs/cifar10_pmf_adamw_transformer_naive_v2 \
+  --workdir ./runs/cifar10_pmf_adamw_transformer_naive \
   --dataset cifar10 \
   --backbone transformer \
   --variant pmf \
   --optimizer adamw \
   --attn-impl naive \
   --max-steps 5000 \
-  --batch-size 256 \
+  --batch-size 32 \
+  --grad-accum-steps 8 \
   --eval-every 250 \
   --sample-every 500 \
   --save-every 500 \
+  --sample-batch-size 8 \
   --num-workers 4
 ```
 
@@ -126,17 +80,19 @@ python meanflow.py \
 
 ```bash
 python meanflow.py \
-  --workdir ./runs/cifar10_pmf_muon_transformer_naive_v2 \
+  --workdir ./runs/cifar10_pmf_muon_transformer_naive \
   --dataset cifar10 \
   --backbone transformer \
   --variant pmf \
   --optimizer muon \
   --attn-impl naive \
   --max-steps 5000 \
-  --batch-size 256 \
+  --batch-size 32 \
+  --grad-accum-steps 8 \
   --eval-every 250 \
   --sample-every 500 \
   --save-every 500 \
+  --sample-batch-size 8 \
   --num-workers 4
 ```
 
@@ -144,42 +100,89 @@ python meanflow.py \
 
 ```bash
 python meanflow.py \
-  --workdir ./runs/cifar10_pmf_muon_transformer_residual_v2 \
+  --workdir ./runs/cifar10_pmf_muon_transformer_residual \
   --dataset cifar10 \
   --backbone transformer \
   --variant pmf \
   --optimizer muon \
   --attn-impl residual \
   --max-steps 5000 \
-  --batch-size 256 \
+  --batch-size 32 \
+  --grad-accum-steps 8 \
   --eval-every 250 \
   --sample-every 500 \
   --save-every 500 \
+  --sample-batch-size 8 \
   --num-workers 4
 ```
 
 ## 3. 恢复训练
 
-`--resume` 要指向具体 checkpoint 文件，不是目录。
-
 ```bash
 python meanflow.py \
-  --workdir ./runs/cifar10_pmf_muon_transformer_residual_v2 \
+  --workdir ./runs/cifar10_pmf_muon_transformer_residual \
   --dataset cifar10 \
   --backbone transformer \
   --variant pmf \
   --optimizer muon \
   --attn-impl residual \
   --max-steps 10000 \
-  --batch-size 256 \
+  --batch-size 32 \
+  --grad-accum-steps 8 \
   --eval-every 250 \
   --sample-every 500 \
   --save-every 500 \
+  --sample-batch-size 8 \
   --num-workers 4 \
-  --resume ./runs/cifar10_pmf_muon_transformer_residual_v2/<timestamp>/checkpoints/last.pt
+  --resume ./runs/cifar10_pmf_muon_transformer_residual/<timestamp>/checkpoints/last.pt
 ```
 
-## 4. 你主要看什么
+## 4. 跑 FID
+
+默认用 `best.pt`，参考集用 `cifar10-train`。
+
+### 单组命令模板
+
+```bash
+python fid_eval.py \
+  --run-dir ./runs/cifar10_pmf_adamw_transformer_naive/<timestamp> \
+  --checkpoint best \
+  --data-root ./data \
+  --num-samples 50000 \
+  --gen-bsz 128 \
+  --fid-batch-size 128 \
+  --device cuda
+```
+
+### 三组命令
+
+```bash
+python fid_eval.py --run-dir ./runs/cifar10_pmf_adamw_transformer_naive/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
+python fid_eval.py --run-dir ./runs/cifar10_pmf_muon_transformer_naive/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
+python fid_eval.py --run-dir ./runs/cifar10_pmf_muon_transformer_residual/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
+```
+
+结果会写到：
+
+- `fid/metrics_best_50000.json`
+
+如果你想保留生成图：
+
+```bash
+python fid_eval.py \
+  --run-dir ./runs/cifar10_pmf_muon_transformer_residual/<timestamp> \
+  --checkpoint best \
+  --data-root ./data \
+  --num-samples 50000 \
+  --gen-bsz 128 \
+  --fid-batch-size 128 \
+  --device cuda \
+  --keep-samples
+```
+
+## 5. 结果怎么看
+
+训练时主要看：
 
 - `metrics.json`
 - `samples/step_0000500.png`
@@ -187,12 +190,17 @@ python meanflow.py \
 - `samples/step_0005000.png`
 - `checkpoints/best.pt`
 
-建议优先看 `best.pt` 对应阶段，不要只看最后一步。
+FID 主要看：
 
-## 5. 重要说明
+- `fid/metrics_best_50000.json`
+- 其中的 `metrics.frechet_inception_distance`
 
-- 修复后的 `pMF` 只支持 `transformer`，不再支持 `U-Net + pMF`。
-- 你之前旧版 `pMF` 的结果和 checkpoint 都不该再继续比较，建议全部按新实验重跑。
+## 6. 重要说明
+
+- 修复后的 `pMF` 只支持 `transformer`。
 - `Muon` 只用于 `variant=pmf`。
-- 如果显存不够，先把 `--batch-size` 从 `256` 降到 `128` 或 `64`。
-- 如果只是想快速看趋势，先跑 `1000` step，不要一上来就长跑。
+- 如果训练仍然 OOM，三组一起降到：
+  `--batch-size 16 --grad-accum-steps 16 --sample-batch-size 4`
+- 如果还是 OOM，再把三组一起降到：
+  `--hidden-size 192 --depth 6`
+- 你 2026-04-01 那三组旧 CIFAR10 run 的 checkpoint 目前读不出来，不能直接补算 FID；需要用当前代码重新跑并保存新 checkpoint。
