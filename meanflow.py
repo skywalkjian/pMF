@@ -1240,6 +1240,37 @@ def make_checkpoint(
     }
 
 
+def _coerce_rng_state_tensor(state: Any) -> torch.ByteTensor:
+    if isinstance(state, torch.Tensor):
+        return state.detach().to(device="cpu", dtype=torch.uint8)
+    if isinstance(state, np.ndarray):
+        return torch.as_tensor(state, dtype=torch.uint8, device="cpu")
+    if isinstance(state, (list, tuple)):
+        return torch.tensor(state, dtype=torch.uint8, device="cpu")
+    raise TypeError(f"Unsupported RNG state type: {type(state)!r}")
+
+
+def _restore_rng_state(rng_state: dict[str, Any]) -> None:
+    torch_state = rng_state.get("torch")
+    if torch_state is not None:
+        torch.random.set_rng_state(_coerce_rng_state_tensor(torch_state))
+
+    numpy_state = rng_state.get("numpy")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+
+    python_state = rng_state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+
+    cuda_state = rng_state.get("cuda")
+    if torch.cuda.is_available() and cuda_state is not None:
+        if isinstance(cuda_state, (list, tuple)):
+            torch.cuda.set_rng_state_all([_coerce_rng_state_tensor(state) for state in cuda_state])
+        else:
+            torch.cuda.set_rng_state_all([_coerce_rng_state_tensor(cuda_state)])
+
+
 def restore_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> RunState:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     try:
@@ -1252,11 +1283,7 @@ def restore_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optim
             ) from exc
         raise
     optimizer.load_state_dict(checkpoint["optimizer"])
-    torch.random.set_rng_state(checkpoint["rng_state"]["torch"])
-    np.random.set_state(checkpoint["rng_state"]["numpy"])
-    random.setstate(checkpoint["rng_state"]["python"])
-    if torch.cuda.is_available() and checkpoint["rng_state"]["cuda"] is not None:
-        torch.cuda.set_rng_state_all(checkpoint["rng_state"]["cuda"])
+    _restore_rng_state(checkpoint["rng_state"])
     raw_state = checkpoint["state"]
     return RunState(
         step=raw_state["step"],
