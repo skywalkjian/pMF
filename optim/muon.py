@@ -29,8 +29,9 @@ def muon_update(
     ns_steps: int = 5,
     nesterov: bool = True,
 ) -> torch.Tensor:
-    momentum.lerp_(grad, 1.0 - beta)
-    update = grad.lerp(momentum, beta) if nesterov else momentum
+    # Muon uses the standard momentum buffer update, not EMA-style damping.
+    momentum.mul_(beta).add_(grad)
+    update = grad.add(momentum, alpha=beta) if nesterov else momentum
     if update.ndim == 4:
         update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
