@@ -51,6 +51,16 @@ def cycle(loader: DataLoader):
             yield batch
 
 
+def configure_runtime(deterministic: bool, matmul_precision: str, allow_tf32: bool) -> None:
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(matmul_precision)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -58,8 +68,6 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def to_serializable(value: Any) -> Any:
@@ -432,6 +440,32 @@ class PatchEmbed(nn.Module):
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
+def rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+class FullAttentionResidual(nn.Module):
+    """
+    Full Attention Residuals from arXiv:2603.15031.
+
+    Each layer uses a learned pseudo-query to attend over the embedding and all
+    preceding layer outputs along the depth axis.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.query = nn.Parameter(torch.zeros(hidden_size))
+        self.eps = eps
+
+    def forward(self, history: list[torch.Tensor]) -> torch.Tensor:
+        if not history:
+            raise ValueError("FullAttentionResidual expects a non-empty history.")
+        keys = torch.stack(history, dim=2)
+        scores = torch.einsum("d,btnd->btn", self.query, rms_norm_last_dim(keys, eps=self.eps))
+        weights = scores.softmax(dim=-1, dtype=torch.float32).to(keys.dtype)
+        return torch.einsum("btn,btnd->btd", weights, keys)
+
+
 class TransformerAttention(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, attn_impl: str = "naive"):
         super().__init__()
@@ -445,29 +479,26 @@ class TransformerAttention(nn.Module):
         self.qkv = nn.Linear(hidden_size, hidden_size * 3)
         self.proj = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, x: torch.Tensor, prev_logits: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, tokens, _ = x.shape
         qkv = self.qkv(x).view(batch, tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        if self.attn_impl == "naive":
-            # Let PyTorch dispatch to the fused SDPA kernel when it supports the
-            # current autograd mode; fall back to the explicit implementation for JVP.
-            try:
-                out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-                out = out.transpose(1, 2).contiguous().view(batch, tokens, self.hidden_size)
-                return self.proj(out), None
-            except NotImplementedError:
-                pass
+        # Let PyTorch dispatch to the fused SDPA kernel when it supports the
+        # current autograd mode; fall back to the explicit implementation for JVP.
+        try:
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+            out = out.transpose(1, 2).contiguous().view(batch, tokens, self.hidden_size)
+            return self.proj(out)
+        except NotImplementedError:
+            pass
         logits = torch.matmul(q * self.scale, k.transpose(-1, -2))
-        if prev_logits is not None:
-            logits = logits + prev_logits
         attn = logits.softmax(dim=-1)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.hidden_size)
-        return self.proj(out), logits
+        return self.proj(out)
 
 
 class TransformerMlp(nn.Module):
@@ -492,12 +523,27 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size)
         self.mlp = TransformerMlp(hidden_size, mlp_ratio)
         self.attn_impl = attn_impl
+        self.full_attn_res = FullAttentionResidual(hidden_size) if attn_impl == "residual" else None
 
-    def forward(self, x: torch.Tensor, prev_logits: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
-        attn_out, logits = self.attn(self.norm1(x), prev_logits=prev_logits if self.attn_impl == "residual" else None)
+    def forward(
+        self,
+        x: torch.Tensor,
+        history: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        if self.attn_impl == "residual":
+            if history is None:
+                raise ValueError("Residual attention expects a history of previous layer outputs.")
+            x_in = self.full_attn_res(history)
+            attn_out = self.attn(self.norm1(x_in))
+            x_mid = x_in + attn_out
+            x_out = x_mid + self.mlp(self.norm2(x_mid))
+            layer_output = x_out - x_in
+            return x_out, [*history, layer_output]
+
+        attn_out = self.attn(self.norm1(x))
         x = x + attn_out
         x = x + self.mlp(self.norm2(x))
-        return x, logits if self.attn_impl == "residual" else None
+        return x, history
 
 
 class MeanFlowTransformer(nn.Module):
@@ -551,9 +597,13 @@ class MeanFlowTransformer(nn.Module):
         if exists(h):
             cond = cond + self.delta_embed(h)
         tokens = tokens + self.pos_embed + cond[:, None, :]
-        prev_logits = None
-        for block in self.blocks:
-            tokens, prev_logits = block(tokens, prev_logits=prev_logits)
+        if self.attn_impl == "residual":
+            history = [tokens]
+            for block in self.blocks:
+                tokens, history = block(tokens, history=history)
+        else:
+            for block in self.blocks:
+                tokens, _ = block(tokens)
         tokens = self.norm(tokens)
         patches = self.head(tokens)
         return self.unpatchify(patches)
@@ -666,19 +716,31 @@ class PmfTransformer(nn.Module):
         labels: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = self.build_sequence(x, h, omega, t_min, t_max, labels)
-        prev_logits = None
-        for block in self.shared_blocks:
-            tokens, prev_logits = block(tokens, prev_logits=prev_logits)
+        if self.attn_impl == "residual":
+            shared_history = [tokens]
+            for block in self.shared_blocks:
+                tokens, shared_history = block(tokens, history=shared_history)
 
-        u_tokens = tokens
-        u_logits = prev_logits
-        for block in self.u_heads:
-            u_tokens, u_logits = block(u_tokens, prev_logits=u_logits)
+            u_tokens = tokens
+            u_history = list(shared_history)
+            for block in self.u_heads:
+                u_tokens, u_history = block(u_tokens, history=u_history)
 
-        v_tokens = tokens
-        v_logits = prev_logits
-        for block in self.v_heads:
-            v_tokens, v_logits = block(v_tokens, prev_logits=v_logits)
+            v_tokens = tokens
+            v_history = list(shared_history)
+            for block in self.v_heads:
+                v_tokens, v_history = block(v_tokens, history=v_history)
+        else:
+            for block in self.shared_blocks:
+                tokens, _ = block(tokens)
+
+            u_tokens = tokens
+            for block in self.u_heads:
+                u_tokens, _ = block(u_tokens)
+
+            v_tokens = tokens
+            for block in self.v_heads:
+                v_tokens, _ = block(v_tokens)
 
         u_tokens = self.u_norm(u_tokens[:, self.prefix_tokens :])
         v_tokens = self.v_norm(v_tokens[:, self.prefix_tokens :])
