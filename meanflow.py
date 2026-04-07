@@ -122,6 +122,8 @@ class TrainConfig:
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
     muon_nesterov: bool = True
+    muon_weight_decay: float = 0.01
+    muon_aux_eps: float = 1e-10
     grad_clip: float = 1.0
     model_dim: int = 32
     dim_mults: tuple[int, ...] = (1, 2, 4)
@@ -1117,11 +1119,15 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
 
         muon_params = []
         adamw_params = []
+        muon_param_splits = {}
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             if name.startswith(("shared_blocks.", "u_heads.", "v_heads.")) and param.ndim >= 2 and not name.endswith("bias"):
                 muon_params.append(param)
+                if name.endswith(".attn.qkv.weight"):
+                    # Official Muon recipes work better when Q/K/V are orthogonalized independently.
+                    muon_param_splits[id(param)] = 3
             else:
                 adamw_params.append(param)
 
@@ -1133,7 +1139,7 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
                     "use_muon": True,
                     "lr": config.muon_lr,
                     "momentum": config.muon_momentum,
-                    "weight_decay": config.weight_decay,
+                    "weight_decay": config.muon_weight_decay,
                     "ns_steps": config.muon_ns_steps,
                     "nesterov": config.muon_nesterov,
                 }
@@ -1145,12 +1151,12 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
                     "use_muon": False,
                     "lr": config.lr,
                     "betas": (config.beta1, config.beta2),
-                    "eps": config.eps,
+                    "eps": config.muon_aux_eps,
                     "weight_decay": config.weight_decay,
                 }
             )
 
-        return SingleDeviceMuonWithAuxAdam(param_groups)
+        return SingleDeviceMuonWithAuxAdam(param_groups, muon_param_splits=muon_param_splits)
     raise ValueError(f"Unsupported optimizer: {config.optimizer}")
 
 
@@ -1321,6 +1327,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1e-8)
     parser.add_argument("--weight-decay", type=float, default=0.05)
+    parser.add_argument("--muon-lr", type=float, default=0.02)
+    parser.add_argument("--muon-momentum", type=float, default=0.95)
+    parser.add_argument("--muon-ns-steps", type=int, default=5)
+    parser.add_argument("--muon-nesterov", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--muon-weight-decay", type=float, default=0.01)
+    parser.add_argument("--muon-aux-eps", type=float, default=1e-10)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--model-dim", type=int, default=32)
     parser.add_argument("--dim-mults", type=int, nargs="+", default=[1, 2, 4])
@@ -1371,6 +1383,12 @@ def parse_args() -> TrainConfig:
         beta2=args.beta2,
         eps=args.eps,
         weight_decay=args.weight_decay,
+        muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
+        muon_ns_steps=args.muon_ns_steps,
+        muon_nesterov=args.muon_nesterov,
+        muon_weight_decay=args.muon_weight_decay,
+        muon_aux_eps=args.muon_aux_eps,
         grad_clip=args.grad_clip,
         model_dim=args.model_dim,
         dim_mults=tuple(args.dim_mults),

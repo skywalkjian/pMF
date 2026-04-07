@@ -22,21 +22,49 @@ def zeropower_via_newtonschulz5(grad: torch.Tensor, steps: int) -> torch.Tensor:
     return x.to(grad.dtype)
 
 
+def orthogonalize_update(
+    update: torch.Tensor,
+    ns_steps: int,
+    split_first_dim_chunks: int = 1,
+) -> torch.Tensor:
+    if update.ndim == 4:
+        if split_first_dim_chunks != 1:
+            raise ValueError("split_first_dim_chunks is only supported for 2D Muon parameters.")
+        update = update.view(len(update), -1)
+
+    if split_first_dim_chunks <= 1:
+        orthogonal = zeropower_via_newtonschulz5(update, steps=ns_steps)
+        orthogonal *= max(1.0, orthogonal.size(-2) / orthogonal.size(-1)) ** 0.5
+        return orthogonal
+
+    if update.ndim != 2:
+        raise ValueError("split_first_dim_chunks is only supported for 2D Muon parameters.")
+    if update.size(0) % split_first_dim_chunks != 0:
+        raise ValueError(
+            f"Cannot split shape={tuple(update.shape)} into {split_first_dim_chunks} equal chunks along dim 0."
+        )
+
+    chunks = []
+    for chunk in update.chunk(split_first_dim_chunks, dim=0):
+        orthogonal = zeropower_via_newtonschulz5(chunk, steps=ns_steps)
+        orthogonal *= max(1.0, orthogonal.size(-2) / orthogonal.size(-1)) ** 0.5
+        chunks.append(orthogonal)
+    return torch.cat(chunks, dim=0)
+
+
 def muon_update(
     grad: torch.Tensor,
     momentum: torch.Tensor,
     beta: float = 0.95,
     ns_steps: int = 5,
     nesterov: bool = True,
+    split_first_dim_chunks: int = 1,
 ) -> torch.Tensor:
-    # Muon uses the standard momentum buffer update, not EMA-style damping.
-    momentum.mul_(beta).add_(grad)
-    update = grad.add(momentum, alpha=beta) if nesterov else momentum
-    if update.ndim == 4:
-        update = update.view(len(update), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    update *= max(1.0, update.size(-2) / update.size(-1)) ** 0.5
-    return update
+    # Match the official Muon buffer update so the pre-orthogonalized direction
+    # stays aligned with upstream implementations.
+    momentum.lerp_(grad, 1.0 - beta)
+    update = grad.lerp(momentum, beta) if nesterov else momentum
+    return orthogonalize_update(update, ns_steps=ns_steps, split_first_dim_chunks=split_first_dim_chunks)
 
 
 def adam_update(
@@ -61,8 +89,9 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
     Each param group must include `use_muon=True/False`.
     """
 
-    def __init__(self, param_groups):
+    def __init__(self, param_groups, muon_param_splits: dict[int, int] | None = None):
         normalized_groups = []
+        self.muon_param_splits = dict(muon_param_splits or {})
         for group in param_groups:
             if "use_muon" not in group:
                 raise ValueError("Each param group must define use_muon.")
@@ -117,6 +146,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                         beta=group["momentum"],
                         ns_steps=group["ns_steps"],
                         nesterov=group["nesterov"],
+                        split_first_dim_chunks=self.muon_param_splits.get(id(param), 1),
                     )
                     param.mul_(1.0 - group["lr"] * group["weight_decay"])
                     param.add_(update.reshape_as(param), alpha=-group["lr"])
