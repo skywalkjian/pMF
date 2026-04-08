@@ -523,7 +523,12 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size)
         self.mlp = TransformerMlp(hidden_size, mlp_ratio)
         self.attn_impl = attn_impl
-        self.full_attn_res = FullAttentionResidual(hidden_size) if attn_impl == "residual" else None
+        if attn_impl == "residual":
+            self.pre_attn_residual = FullAttentionResidual(hidden_size)
+            self.pre_mlp_residual = FullAttentionResidual(hidden_size)
+        else:
+            self.pre_attn_residual = None
+            self.pre_mlp_residual = None
 
     def forward(
         self,
@@ -533,12 +538,16 @@ class TransformerBlock(nn.Module):
         if self.attn_impl == "residual":
             if history is None:
                 raise ValueError("Residual attention expects a history of previous layer outputs.")
-            x_in = self.full_attn_res(history)
-            attn_out = self.attn(self.norm1(x_in))
-            x_mid = x_in + attn_out
-            x_out = x_mid + self.mlp(self.norm2(x_mid))
-            layer_output = x_out - x_in
-            return x_out, [*history, layer_output]
+            # Full AttnRes treats self-attention and MLP as separate layers.
+            attn_in = self.pre_attn_residual(history)
+            attn_out = self.attn(self.norm1(attn_in))
+            x = x + attn_out
+            history = [*history, attn_out]
+
+            mlp_in = self.pre_mlp_residual(history)
+            mlp_out = self.mlp(self.norm2(mlp_in))
+            x = x + mlp_out
+            return x, [*history, mlp_out]
 
         attn_out = self.attn(self.norm1(x))
         x = x + attn_out
