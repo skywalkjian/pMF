@@ -532,7 +532,7 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | None = None,
         history: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if self.attn_impl == "residual":
@@ -541,13 +541,14 @@ class TransformerBlock(nn.Module):
             # Full AttnRes treats self-attention and MLP as separate layers.
             attn_in = self.pre_attn_residual(history)
             attn_out = self.attn(self.norm1(attn_in))
-            x = x + attn_out
             history = [*history, attn_out]
 
             mlp_in = self.pre_mlp_residual(history)
             mlp_out = self.mlp(self.norm2(mlp_in))
-            x = x + mlp_out
-            return x, [*history, mlp_out]
+            return mlp_out, [*history, mlp_out]
+
+        if x is None:
+            raise ValueError("Naive attention expects a hidden state tensor.")
 
         attn_out = self.attn(self.norm1(x))
         x = x + attn_out
@@ -580,6 +581,10 @@ class MeanFlowTransformer(nn.Module):
         self.blocks = nn.ModuleList(
             [TransformerBlock(hidden_size, num_heads, mlp_ratio, attn_impl=attn_impl) for _ in range(depth)]
         )
+        if attn_impl == "residual":
+            self.output_residual = FullAttentionResidual(hidden_size)
+        else:
+            self.output_residual = None
         self.norm = nn.LayerNorm(hidden_size)
         self.head = nn.Linear(hidden_size, patch_size * patch_size * channels)
         nn.init.normal_(self.pos_embed, std=0.02)
@@ -609,7 +614,8 @@ class MeanFlowTransformer(nn.Module):
         if self.attn_impl == "residual":
             history = [tokens]
             for block in self.blocks:
-                tokens, history = block(tokens, history=history)
+                _, history = block(history=history)
+            tokens = self.output_residual(history)
         else:
             for block in self.blocks:
                 tokens, _ = block(tokens)
@@ -670,6 +676,12 @@ class PmfTransformer(nn.Module):
         self.v_heads = nn.ModuleList(
             [TransformerBlock(hidden_size, num_heads, mlp_ratio, attn_impl=attn_impl) for _ in range(head_depth)]
         )
+        if attn_impl == "residual":
+            self.u_output_residual = FullAttentionResidual(hidden_size)
+            self.v_output_residual = FullAttentionResidual(hidden_size)
+        else:
+            self.u_output_residual = None
+            self.v_output_residual = None
         self.u_norm = nn.LayerNorm(hidden_size)
         self.v_norm = nn.LayerNorm(hidden_size)
         self.u_head = nn.Linear(hidden_size, patch_size * patch_size * channels)
@@ -728,17 +740,17 @@ class PmfTransformer(nn.Module):
         if self.attn_impl == "residual":
             shared_history = [tokens]
             for block in self.shared_blocks:
-                tokens, shared_history = block(tokens, history=shared_history)
+                _, shared_history = block(history=shared_history)
 
-            u_tokens = tokens
             u_history = list(shared_history)
             for block in self.u_heads:
-                u_tokens, u_history = block(u_tokens, history=u_history)
+                _, u_history = block(history=u_history)
+            u_tokens = self.u_output_residual(u_history)
 
-            v_tokens = tokens
             v_history = list(shared_history)
             for block in self.v_heads:
-                v_tokens, v_history = block(v_tokens, history=v_history)
+                _, v_history = block(history=v_history)
+            v_tokens = self.v_output_residual(v_history)
         else:
             for block in self.shared_blocks:
                 tokens, _ = block(tokens)
