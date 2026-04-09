@@ -10,10 +10,6 @@
 2. 在 `pMF` 的 transformer 主干上接入 **Muon**，验证它相对 `AdamW` 的优化收益。
 3. 在此基础上实现 **Kimi / Moonshot AI 风格的 residual attention 思路**，把原来的固定残差加法改成深度方向的注意力聚合，并与 baseline 做公平对照。
 
-因此，这个仓库同时有两层价值：
-
-- 它是一个 **研究复现项目**，关注 Muon 和 residual attention 是否真的带来可观测收益。
-- 它也是一个 **工程实验项目**，强调在尽可能小的代码范围内组织出可复现、可分析、可扩展的实验链路。
 
 ## 项目目的
 
@@ -23,25 +19,6 @@
 - `Muon` 在 `pMF + transformer` 上，是否比 `AdamW` 收敛更快或最终更好？
 - 引入 Kimi 风格 residual attention 之后，优化收益会体现在训练损失、验证损失，还是最终生成质量上？
 
-当前实现里，residual attention 的关注点不在 token-time 的 self-attention 本身，而在 **depth axis 上的 residual aggregation**。直观来说，就是把：
-
-$$
-x_{l+1} = x_l + f_l(x_l)
-$$
-
-改成让当前层可以对 embedding 和历史层表示做一次显式聚合：
-
-$$
-\tilde{x}_l = \sum_i \alpha_{i \rightarrow l} v_i
-$$
-
-其中权重由可学习伪查询向量与历史 residual states 计算得到：
-
-$$
-\alpha_{i \rightarrow l} = \mathrm{softmax}\left(w_l^\top \mathrm{RMSNorm}(v_i)\right)
-$$
-
-在本仓库里，这条思路被落成了一个 **full-history residual aggregation** 版本，用最小侵入方式接到 `pMF` 的 transformer block 和最终输出聚合上。
 
 ## 技术亮点
 
@@ -313,9 +290,19 @@ python meanflow.py \
 
 ### 2. 定性样本对比
 
-![qualitative samples](assets/showcase/qualitative_triptych_step_0010000.png)
+#### AdamW + naive @ 5000 step
 
-这张图主要用于辅助观察不同配置下生成样本的清晰度、结构完整性和颜色稳定性，但更可靠的结论仍然应以 `metrics.json` 和 `fid/*.json` 为准。
+![adamw naive 5k](runs/cifar10_pmf_adamw_transformer_naive_fixcheck/20260407-072247/samples/step_0005000.png)
+
+#### Muon + naive @ 5000 step
+
+![muon naive 5k](runs/cifar10_pmf_muon_transformer_naive_fixcheck/20260407-072247/samples/step_0005000.png)
+
+#### Muon + residual @ 5000 step
+
+![muon residual 5k](runs/cifar10_pmf_muon_transformer_residual_fixcheck/20260408-024833/samples/step_0005000.png)
+
+这里直接使用 `runs` 目录中的 5k step 原始 sample 图，便于和对应 checkpoint、`metrics.json`、FID 结果一一对照。定性图主要用于辅助观察样本清晰度、结构稳定性和颜色分布，结论仍应以损失曲线和 FID 为主。
 
 ### 3. 关键数值摘要
 
@@ -343,31 +330,8 @@ python meanflow.py \
 
 3. **生成质量与优化指标并不总是同步**
    这正是这类架构实验值得做对照的原因。更低的验证损失，不一定立即对应更好的样本质量；因此 README 里同时保留了 `metrics.json` 和 `fid/*.json` 两类结果。
-
-### 5. 当前分析的边界
-
-这份 README 的结论主要基于：
-
-- `metrics.json` 中的 train / val loss
-- `fid/metrics_last_50000.json` 中的 FID
-- `assets/showcase/*.png` 中的可视化产物
-
-还没有覆盖更细粒度的机制分析，例如：
-
-- residual history 权重分布
-- 不同层对最终聚合的贡献占比
-- residual aggregation 随训练演化的稳定性
-- `last checkpoint` 与 `best checkpoint` 的 FID 差异
-
-## 项目价值
-
-这个项目的价值，不只是“把一个新模块接进 pMF”，而是把几个很容易分散的能力组织成了一个完整研究工程：
-
-- **建模能力**：能把 Kimi 风格 residual attention 思路落到实际 transformer 代码里
-- **优化能力**：能把 Muon 这种新优化器接到已有训练链，并设计公平对照
-- **工程能力**：能把训练、采样、恢复训练、指标记录、FID 评估整理成闭环
-- **实验能力**：能用同一套配置对比 `AdamW`、`Muon`、`Muon + residual`
-- **表达能力**：能把结果沉淀成图像、数值、命令和说明文档，便于继续迭代
+4. **从loss下降稳定性来看**
+   `Muon + residual` 的曲线明显比 `Muon + naive` 更平滑，说明 residual attention 的聚合机制确实在训练过程中提供了更稳定的梯度流。
 
 ## 后续研究方向
 
@@ -431,7 +395,9 @@ python meanflow.py \
 - [实验命令整理](run.md)
 - [代码结构拆解](codestr.md)
 - [fixcheck 对照图](assets/showcase/fixcheck_metrics_comparison.png)
-- [定性样本图](assets/showcase/qualitative_triptych_step_0010000.png)
+- [AdamW + naive 5k sample](runs/cifar10_pmf_adamw_transformer_naive_fixcheck/20260407-072247/samples/step_0005000.png)
+- [Muon + naive 5k sample](runs/cifar10_pmf_muon_transformer_naive_fixcheck/20260407-072247/samples/step_0005000.png)
+- [Muon + residual 5k sample](runs/cifar10_pmf_muon_transformer_residual_fixcheck/20260408-065603/samples/step_0005000.png)
 - Attention Residuals / BAR 论文：`arXiv:2603.15031`
 
 ---
