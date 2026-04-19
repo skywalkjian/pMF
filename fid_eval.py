@@ -24,7 +24,7 @@ from meanflow import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compute FID for meanflow.py experiments.")
+    parser = argparse.ArgumentParser(description="Compute FID for pMF experiments.")
     parser.add_argument("--run-dir", type=str, required=True, help="Experiment run directory that contains config.json.")
     parser.add_argument("--ckpt-path", type=str, default="", help="Optional explicit checkpoint path.")
     parser.add_argument("--checkpoint", type=str, choices=["best", "last"], default="best", help="Checkpoint name under run_dir/checkpoints when --ckpt-path is not given.")
@@ -126,11 +126,9 @@ def generate_fid_samples(
             generator=generator,
             device=device,
         )
-        labels = None
-        if config.variant == "pmf":
-            labels = (torch.arange(start, start + current_bsz, device=device, dtype=torch.long) % spec.num_classes)
+        labels = torch.arange(start, start + current_bsz, device=device, dtype=torch.long) % spec.num_classes
 
-        samples = generate_samples(model, noise, config.variant, labels=labels, config=config)
+        samples = generate_samples(model, noise, labels, config)
         images = denormalize_images(samples, spec.mean, spec.std).cpu()
 
         for local_idx in range(current_bsz):
@@ -159,7 +157,7 @@ def main() -> None:
 
     if config.dataset != "cifar10":
         raise ValueError(f"FID evaluation script currently targets CIFAR10 runs, got dataset={config.dataset!r}.")
-    if config.variant == "pmf" and args.num_samples % 10 != 0:
+    if args.num_samples % 10 != 0:
         raise ValueError("For CIFAR10 pMF runs, --num-samples should be divisible by 10 so class labels stay balanced.")
 
     device = resolve_device(args.device)
@@ -242,7 +240,7 @@ def main() -> None:
         "checkpoint": str(ckpt_path),
         "step": state.step,
         "dataset": config.dataset,
-        "variant": config.variant,
+        "variant": "pmf",
         "optimizer": config.optimizer,
         "attn_impl": config.attn_impl,
         "num_samples": args.num_samples,

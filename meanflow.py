@@ -1,11 +1,7 @@
 """
-One-step MeanFlow training centered on this file.
+Pixel MeanFlow (pMF) training centered on this file.
 
-Commit 1 keeps the original algorithmic scope:
-- MNIST
-- U-Net backbone
-- MeanFlow objective
-- Adam optimizer
+Scope: PmfTransformer backbone + PixelMeanFlowLoss objective.
 """
 
 from __future__ import annotations
@@ -17,32 +13,20 @@ import os
 import random
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from functools import partial
-from inspect import isfunction
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import einsum, nn
+from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms as T
-from torchvision.datasets import CIFAR10, MNIST
+from torchvision.datasets import CIFAR10
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
 from optim import SingleDeviceMuonWithAuxAdam
-
-
-def exists(x: Any) -> bool:
-    return x is not None
-
-
-def default(val: Any, d: Any) -> Any:
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
 
 
 def cycle(loader: DataLoader):
@@ -78,34 +62,12 @@ def to_serializable(value: Any) -> Any:
     return value
 
 
-def channel_last_vector_to_spatial(x: torch.Tensor) -> torch.Tensor:
-    return x[:, :, None, None]
-
-
-def conv_qkv_to_heads(x: torch.Tensor, heads: int) -> torch.Tensor:
-    batch, channels, height, width = x.shape
-    dim_head = channels // heads
-    return x.view(batch, heads, dim_head, height * width)
-
-
-def heads_to_spatial(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    batch, heads, tokens, dim_head = x.shape
-    return x.permute(0, 1, 3, 2).contiguous().view(batch, heads * dim_head, height, width)
-
-
-def heads_channels_to_spatial(x: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    batch, heads, channels, tokens = x.shape
-    return x.contiguous().view(batch, heads * channels, height, width)
-
-
 @dataclass
 class TrainConfig:
-    workdir: str = "./runs/mnist_meanflow"
+    workdir: str = "./runs/cifar10_pmf"
     data_root: str = "./data"
     resume: str = ""
-    dataset: str = "mnist"
-    backbone: str = "unet"
-    variant: str = "meanflow"
+    dataset: str = "cifar10"
     optimizer: str = "adamw"
     attn_impl: str = "naive"
     seed: int = 1024
@@ -133,15 +95,11 @@ class TrainConfig:
     muon_weight_decay: float = 0.01
     muon_aux_eps: float = 1e-10
     grad_clip: float = 1.0
-    model_dim: int = 32
-    dim_mults: tuple[int, ...] = (1, 2, 4)
-    convnext_mult: int = 2
     patch_size: int = 4
     hidden_size: int = 256
     depth: int = 8
     num_heads: int = 4
     mlp_ratio: float = 4.0
-    t_min: float = 0.02
     p_mean: float = -0.4
     p_std: float = 1.0
     cfg_max: float = 7.0
@@ -174,220 +132,6 @@ class RunState:
     val_loss: list[float] = field(default_factory=list)
 
 
-class Residual(nn.Module):
-    def __init__(self, fn: nn.Module):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x, *args, **kwargs):
-        return self.fn(x, *args, **kwargs) + x
-
-
-def Upsample(dim: int) -> nn.Module:
-    return nn.ConvTranspose2d(dim, dim, 4, 2, 1)
-
-
-def Downsample(dim: int) -> nn.Module:
-    return nn.Conv2d(dim, dim, 4, 2, 1)
-
-
-class SinusoidalPositionEmbeddings(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, time: torch.Tensor) -> torch.Tensor:
-        device = time.device
-        half_dim = self.dim // 2
-        scale = math.log(10000) / max(half_dim - 1, 1)
-        freqs = torch.exp(torch.arange(half_dim, device=device) * -scale)
-        embeddings = time[:, None] * freqs[None, :]
-        return torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-
-
-class ConvNextBlock(nn.Module):
-    def __init__(self, dim: int, dim_out: int, *, time_emb_dim: int | None = None, mult: int = 2, norm: bool = True):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.GELU(), nn.Linear(time_emb_dim, dim)) if exists(time_emb_dim) else None
-        self.ds_conv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
-        self.net = nn.Sequential(
-            nn.GroupNorm(1, dim) if norm else nn.Identity(),
-            nn.Conv2d(dim, dim_out * mult, 3, padding=1),
-            nn.GELU(),
-            nn.GroupNorm(1, dim_out * mult),
-            nn.Conv2d(dim_out * mult, dim_out, 3, padding=1),
-        )
-        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor | None = None) -> torch.Tensor:
-        h = self.ds_conv(x)
-        if exists(self.mlp) and exists(time_emb):
-            condition = self.mlp(time_emb)
-            h = h + channel_last_vector_to_spatial(condition)
-        h = self.net(h)
-        return h + self.res_conv(x)
-
-
-class Attention(nn.Module):
-    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, _, height, width = x.shape
-        q, k, v = map(
-            lambda t: conv_qkv_to_heads(t, self.heads),
-            self.to_qkv(x).chunk(3, dim=1),
-        )
-        q = q * self.scale
-        sim = einsum("b h d i, b h d j -> b h i j", q, k)
-        sim = sim - sim.amax(dim=-1, keepdim=True).detach()
-        attn = sim.softmax(dim=-1)
-        out = einsum("b h i j, b h d j -> b h i d", attn, v)
-        out = heads_to_spatial(out, height, width)
-        return self.to_out(out)
-
-
-class LinearAttention(nn.Module):
-    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        hidden_dim = dim_head * heads
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), nn.GroupNorm(1, dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, _, height, width = x.shape
-        q, k, v = map(
-            lambda t: conv_qkv_to_heads(t, self.heads),
-            self.to_qkv(x).chunk(3, dim=1),
-        )
-        q = q.softmax(dim=-2)
-        k = k.softmax(dim=-1)
-        q = q * self.scale
-        context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
-        out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
-        out = heads_channels_to_spatial(out, height, width)
-        return self.to_out(out)
-
-
-class PreNorm(nn.Module):
-    def __init__(self, dim: int, fn: nn.Module):
-        super().__init__()
-        self.fn = fn
-        self.norm = nn.GroupNorm(1, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fn(self.norm(x))
-
-
-class Unet(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        init_dim: int | None = None,
-        out_dim: int | None = None,
-        dim_mults: tuple[int, ...] = (1, 2, 4, 8),
-        channels: int = 1,
-        with_time_emb: bool = True,
-        convnext_mult: int = 2,
-    ):
-        super().__init__()
-        init_dim = default(init_dim, dim // 3 * 2)
-        dims = [init_dim, *map(lambda mult: dim * mult, dim_mults)]
-        in_out = list(zip(dims[:-1], dims[1:]))
-        block = partial(ConvNextBlock, mult=convnext_mult)
-
-        self.init_conv = nn.Conv2d(channels, init_dim, 7, padding=3)
-
-        if with_time_emb:
-            time_dim = dim * 4
-            self.time_mlp = nn.Sequential(
-                SinusoidalPositionEmbeddings(dim),
-                nn.Linear(dim, time_dim),
-                nn.GELU(),
-                nn.Linear(time_dim, time_dim),
-            )
-            self.time_mlp_h = nn.Sequential(
-                SinusoidalPositionEmbeddings(dim),
-                nn.Linear(dim, time_dim),
-                nn.GELU(),
-                nn.Linear(time_dim, time_dim),
-            )
-        else:
-            time_dim = None
-            self.time_mlp = None
-            self.time_mlp_h = None
-
-        self.downs = nn.ModuleList()
-        self.ups = nn.ModuleList()
-        num_resolutions = len(in_out)
-
-        for index, (dim_in, dim_out) in enumerate(in_out):
-            is_last = index >= (num_resolutions - 1)
-            self.downs.append(
-                nn.ModuleList(
-                    [
-                        block(dim_in, dim_out, time_emb_dim=time_dim),
-                        block(dim_out, dim_out, time_emb_dim=time_dim),
-                        Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                        Downsample(dim_out) if not is_last else nn.Identity(),
-                    ]
-                )
-            )
-
-        mid_dim = dims[-1]
-        self.mid_block1 = block(mid_dim, mid_dim, time_emb_dim=time_dim)
-        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
-        self.mid_block2 = block(mid_dim, mid_dim, time_emb_dim=time_dim)
-
-        for index, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
-            is_last = index >= (num_resolutions - 1)
-            self.ups.append(
-                nn.ModuleList(
-                    [
-                        block(dim_out * 2, dim_in, time_emb_dim=time_dim),
-                        block(dim_in, dim_in, time_emb_dim=time_dim),
-                        Residual(PreNorm(dim_in, LinearAttention(dim_in))),
-                        Upsample(dim_in) if not is_last else nn.Identity(),
-                    ]
-                )
-            )
-
-        out_dim = default(out_dim, channels)
-        self.final_conv = nn.Sequential(block(dim, dim), nn.Conv2d(dim, out_dim, 1))
-
-    def forward(self, x: torch.Tensor, time: torch.Tensor, h: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.init_conv(x)
-        time_emb = self.time_mlp(time) if exists(self.time_mlp) else None
-        if exists(h) and exists(self.time_mlp_h):
-            time_emb = time_emb + self.time_mlp_h(h)
-
-        residuals = []
-        for block1, block2, attn, downsample in self.downs:
-            x = block1(x, time_emb)
-            x = block2(x, time_emb)
-            x = attn(x)
-            residuals.append(x)
-            x = downsample(x)
-
-        x = self.mid_block1(x, time_emb)
-        x = self.mid_attn(x)
-        x = self.mid_block2(x, time_emb)
-
-        for block1, block2, attn, upsample in self.ups:
-            x = torch.cat((x, residuals.pop()), dim=1)
-            x = block1(x, time_emb)
-            x = block2(x, time_emb)
-            x = attn(x)
-            x = upsample(x)
-
-        return self.final_conv(x)
 
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
@@ -556,74 +300,6 @@ class TransformerBlock(nn.Module):
         return x, history
 
 
-class MeanFlowTransformer(nn.Module):
-    def __init__(
-        self,
-        image_size: int,
-        patch_size: int,
-        channels: int,
-        hidden_size: int,
-        depth: int,
-        num_heads: int,
-        mlp_ratio: float,
-        attn_impl: str,
-    ):
-        super().__init__()
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.channels = channels
-        self.hidden_size = hidden_size
-        self.attn_impl = attn_impl
-        self.patch_embed = PatchEmbed(image_size, patch_size, channels, hidden_size)
-        self.time_embed = ScalarConditionEmbed(hidden_size)
-        self.delta_embed = ScalarConditionEmbed(hidden_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, hidden_size))
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(hidden_size, num_heads, mlp_ratio, attn_impl=attn_impl) for _ in range(depth)]
-        )
-        if attn_impl == "residual":
-            self.output_residual = FullAttentionResidual(hidden_size)
-        else:
-            self.output_residual = None
-        self.norm = nn.LayerNorm(hidden_size)
-        self.head = nn.Linear(hidden_size, patch_size * patch_size * channels)
-        nn.init.normal_(self.pos_embed, std=0.02)
-
-    def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
-        batch, tokens, _ = patches.shape
-        grid_size = int(math.sqrt(tokens))
-        if grid_size * grid_size != tokens:
-            raise ValueError(f"Token count {tokens} is not a square grid.")
-        patches = patches.view(
-            batch,
-            grid_size,
-            grid_size,
-            self.patch_size,
-            self.patch_size,
-            self.channels,
-        )
-        patches = patches.permute(0, 5, 1, 3, 2, 4).contiguous()
-        return patches.view(batch, self.channels, self.image_size, self.image_size)
-
-    def forward(self, x: torch.Tensor, time: torch.Tensor, h: torch.Tensor | None = None) -> torch.Tensor:
-        tokens = self.patch_embed(x)
-        cond = self.time_embed(time)
-        if exists(h):
-            cond = cond + self.delta_embed(h)
-        tokens = tokens + self.pos_embed + cond[:, None, :]
-        if self.attn_impl == "residual":
-            history = [tokens]
-            for block in self.blocks:
-                _, history = block(history=history)
-            tokens = self.output_residual(history)
-        else:
-            for block in self.blocks:
-                tokens, _ = block(tokens)
-        tokens = self.norm(tokens)
-        patches = self.head(tokens)
-        return self.unpatchify(patches)
-
-
 class PmfTransformer(nn.Module):
     def __init__(
         self,
@@ -776,83 +452,6 @@ class PmfTransformer(nn.Module):
 
 def build_meanflow_corruption(x0: torch.Tensor, eps: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
     return (1.0 - tau) * x0 + tau * eps
-
-
-def sample_time_from_noise(
-    shape: tuple[int, ...],
-    device: torch.device,
-    noise_dist: str,
-    p_mean: float,
-    p_std: float,
-    t_min: float,
-) -> torch.Tensor:
-    if noise_dist == "logit_normal":
-        raw = torch.sigmoid(torch.randn(shape, device=device) * p_std + p_mean)
-    elif noise_dist == "uniform":
-        raw = torch.rand(shape, device=device)
-    else:
-        raise ValueError(f"Unknown noise distribution: {noise_dist}")
-    return t_min + (1.0 - t_min) * raw
-
-
-class MeanFlowLoss:
-    def __init__(
-        self,
-        p_mean: float = -0.4,
-        p_std: float = 1.0,
-        noise_dist: str = "logit_normal",
-        norm_p: float = 1.0,
-        norm_eps: float = 1.0,
-        t_min: float = 0.02,
-    ):
-        self.p_mean = p_mean
-        self.p_std = p_std
-        self.noise_dist = noise_dist
-        self.norm_p = norm_p
-        self.norm_eps = norm_eps
-        self.t_min = t_min
-
-    def noise_distribution(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
-        if self.noise_dist == "logit_normal":
-            rnd_normal = torch.randn(shape, device=device)
-            return torch.sigmoid(rnd_normal * self.p_std + self.p_mean)
-        if self.noise_dist == "uniform":
-            return torch.rand(shape, device=device)
-        raise ValueError(f"Unknown noise distribution: {self.noise_dist}")
-
-    def __call__(self, net: nn.Module, images: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
-        x0 = images
-        batch = x0.shape[0]
-        device = x0.device
-        shape = (batch, 1, 1, 1)
-
-        tau = self.noise_distribution(shape, device)
-        tau = self.t_min + (1.0 - self.t_min) * tau
-        r = torch.zeros(shape, device=device)
-        eps = torch.randn_like(x0)
-
-        def corruption_of_tau(tau_in: torch.Tensor) -> torch.Tensor:
-            return build_meanflow_corruption(x0, eps, tau_in)
-
-        x_t, v_g = torch.func.jvp(corruption_of_tau, (tau,), (torch.ones_like(tau),))
-
-        def u_wrapper(x: torch.Tensor, tau_val: torch.Tensor, r_val: torch.Tensor) -> torch.Tensor:
-            return net(x, tau_val.view(batch), h=(tau_val - r_val).view(batch))
-
-        u, du_dt = torch.func.jvp(
-            u_wrapper,
-            (x_t, tau, r),
-            (v_g, torch.ones_like(tau), torch.zeros_like(r)),
-        )
-
-        h = torch.clamp(tau - r, min=0.0, max=1.0)
-        u_target = (v_g - h * du_dt).detach()
-        err2 = (u - u_target).pow(2).mean(dim=[1, 2, 3])
-
-        with torch.no_grad():
-            adaptive_weight = 1.0 / (err2 + self.norm_eps).pow(self.norm_p)
-
-        return (err2 * adaptive_weight).mean()
 
 
 class PixelMeanFlowLoss:
@@ -1038,14 +637,6 @@ class PixelMeanFlowLoss:
         return (self.adaptive_weight(loss_u) + self.adaptive_weight(loss_v)).mean()
 
 
-@torch.no_grad()
-def generate_meanflow(model: nn.Module, noise_x: torch.Tensor) -> torch.Tensor:
-    batch = noise_x.shape[0]
-    tau = torch.ones(batch, device=noise_x.device, dtype=noise_x.dtype)
-    h = torch.ones_like(tau)
-    return noise_x - model(noise_x, tau, h)
-
-
 def build_sample_labels(num_classes: int, batch_size: int, device: torch.device) -> torch.Tensor:
     return torch.arange(batch_size, device=device, dtype=torch.long) % num_classes
 
@@ -1075,32 +666,23 @@ def generate_pmf(
 
 @torch.no_grad()
 def generate_samples(
-    model: nn.Module,
+    model: PmfTransformer,
     noise_x: torch.Tensor,
-    variant: str,
-    labels: torch.Tensor | None = None,
-    config: TrainConfig | None = None,
+    labels: torch.Tensor,
+    config: TrainConfig,
 ) -> torch.Tensor:
-    if variant == "meanflow":
-        return generate_meanflow(model, noise_x)
-    if variant == "pmf":
-        if labels is None or config is None:
-            raise ValueError("pMF sample generation requires labels and config.")
-        return generate_pmf(
-            model,
-            noise_x,
-            labels,
-            config.sample_steps,
-            config.sample_omega,
-            config.sample_t_min,
-            config.sample_t_max,
-        )
-    raise ValueError(f"Unsupported variant: {variant}")
+    return generate_pmf(
+        model,
+        noise_x,
+        labels,
+        config.sample_steps,
+        config.sample_omega,
+        config.sample_t_min,
+        config.sample_t_max,
+    )
 
 
 def get_dataset_spec(dataset_name: str) -> DatasetSpec:
-    if dataset_name == "mnist":
-        return DatasetSpec(name="mnist", channels=1, image_size=32, num_classes=10, mean=(0.5,), std=(0.5,))
     if dataset_name == "cifar10":
         return DatasetSpec(
             name="cifar10",
@@ -1115,12 +697,6 @@ def get_dataset_spec(dataset_name: str) -> DatasetSpec:
 
 def build_datasets(config: TrainConfig):
     spec = get_dataset_spec(config.dataset)
-    if config.dataset == "mnist":
-        train_transform = T.Compose([T.ToTensor(), T.Pad(2), T.Normalize(spec.mean, spec.std)])
-        eval_transform = train_transform
-        train_dataset = MNIST(config.data_root, train=True, transform=train_transform, download=True)
-        eval_dataset = MNIST(config.data_root, train=False, transform=eval_transform, download=True)
-        return train_dataset, eval_dataset, spec
     if config.dataset == "cifar10":
         train_transform = T.Compose([T.RandomHorizontalFlip(), T.ToTensor(), T.Normalize(spec.mean, spec.std)])
         eval_transform = T.Compose([T.ToTensor(), T.Normalize(spec.mean, spec.std)])
@@ -1146,41 +722,19 @@ def build_dataloader(dataset, batch_size: int, shuffle: bool, num_workers: int, 
     )
 
 
-def build_model(config: TrainConfig, spec: DatasetSpec) -> nn.Module:
-    if config.variant == "pmf":
-        if config.backbone != "transformer":
-            raise ValueError("pMF is only supported with the transformer backbone after the JAX-aligned rewrite.")
-        return PmfTransformer(
-            image_size=spec.image_size,
-            patch_size=config.patch_size,
-            channels=spec.channels,
-            hidden_size=config.hidden_size,
-            depth=config.depth,
-            num_heads=config.num_heads,
-            mlp_ratio=config.mlp_ratio,
-            num_classes=spec.num_classes,
-            attn_impl=config.attn_impl,
-            noise_scale=config.noise_scale,
-        )
-    if config.backbone == "unet":
-        return Unet(
-            dim=config.model_dim,
-            channels=spec.channels,
-            dim_mults=tuple(config.dim_mults),
-            convnext_mult=config.convnext_mult,
-        )
-    if config.backbone == "transformer":
-        return MeanFlowTransformer(
-            image_size=spec.image_size,
-            patch_size=config.patch_size,
-            channels=spec.channels,
-            hidden_size=config.hidden_size,
-            depth=config.depth,
-            num_heads=config.num_heads,
-            mlp_ratio=config.mlp_ratio,
-            attn_impl=config.attn_impl,
-        )
-    raise ValueError(f"Unsupported backbone: {config.backbone}")
+def build_model(config: TrainConfig, spec: DatasetSpec) -> PmfTransformer:
+    return PmfTransformer(
+        image_size=spec.image_size,
+        patch_size=config.patch_size,
+        channels=spec.channels,
+        hidden_size=config.hidden_size,
+        depth=config.depth,
+        num_heads=config.num_heads,
+        mlp_ratio=config.mlp_ratio,
+        num_classes=spec.num_classes,
+        attn_impl=config.attn_impl,
+        noise_scale=config.noise_scale,
+    )
 
 
 def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimizer:
@@ -1195,11 +749,6 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
             weight_decay=config.weight_decay,
         )
     if config.optimizer == "muon":
-        if config.variant != "pmf":
-            raise ValueError("Muon is only enabled for variant=pmf in this experiment chain.")
-        if not isinstance(model, PmfTransformer):
-            raise ValueError("Muon is only supported for the transformer backbone in this experiment chain.")
-
         muon_params = []
         adamw_params = []
         muon_param_splits = {}
@@ -1243,31 +792,20 @@ def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optimi
     raise ValueError(f"Unsupported optimizer: {config.optimizer}")
 
 
-def build_loss(config: TrainConfig):
-    if config.variant == "meanflow":
-        return MeanFlowLoss(
-            p_mean=config.p_mean,
-            p_std=config.p_std,
-            noise_dist=config.noise_dist,
-            norm_p=config.norm_p,
-            norm_eps=config.norm_eps,
-            t_min=config.t_min,
-        )
-    if config.variant == "pmf":
-        return PixelMeanFlowLoss(
-            p_mean=config.p_mean,
-            p_std=config.p_std,
-            noise_dist=config.noise_dist,
-            cfg_max=config.cfg_max,
-            cfg_beta=config.cfg_beta,
-            class_dropout_prob=config.class_dropout_prob,
-            data_proportion=config.data_proportion,
-            noise_scale=config.noise_scale,
-            tr_uniform=config.tr_uniform,
-            norm_p=config.norm_p,
-            norm_eps=config.norm_eps,
-        )
-    raise ValueError(f"Unsupported variant: {config.variant}")
+def build_loss(config: TrainConfig) -> PixelMeanFlowLoss:
+    return PixelMeanFlowLoss(
+        p_mean=config.p_mean,
+        p_std=config.p_std,
+        noise_dist=config.noise_dist,
+        cfg_max=config.cfg_max,
+        cfg_beta=config.cfg_beta,
+        class_dropout_prob=config.class_dropout_prob,
+        data_proportion=config.data_proportion,
+        noise_scale=config.noise_scale,
+        tr_uniform=config.tr_uniform,
+        norm_p=config.norm_p,
+        norm_eps=config.norm_eps,
+    )
 
 
 def get_run_dir(config: TrainConfig) -> Path:
@@ -1383,13 +921,11 @@ def restore_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optim
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train one-step MeanFlow baselines from meanflow.py.")
-    parser.add_argument("--workdir", type=str, default="./runs/mnist_meanflow")
+    parser = argparse.ArgumentParser(description="Train Pixel MeanFlow (pMF).")
+    parser.add_argument("--workdir", type=str, default="./runs/cifar10_pmf")
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--dataset", type=str, choices=["mnist", "cifar10"], default="mnist")
-    parser.add_argument("--backbone", type=str, choices=["unet", "transformer"], default="unet")
-    parser.add_argument("--variant", type=str, choices=["meanflow", "pmf"], default="meanflow")
+    parser.add_argument("--dataset", type=str, default="cifar10")
     parser.add_argument("--optimizer", type=str, choices=["adam", "adamw", "muon"], default="adamw")
     parser.add_argument("--attn-impl", type=str, choices=["naive", "residual"], default="naive")
     parser.add_argument("--seed", type=int, default=1024)
@@ -1417,15 +953,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--muon-weight-decay", type=float, default=0.01)
     parser.add_argument("--muon-aux-eps", type=float, default=1e-10)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--model-dim", type=int, default=32)
-    parser.add_argument("--dim-mults", type=int, nargs="+", default=[1, 2, 4])
-    parser.add_argument("--convnext-mult", type=int, default=2)
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
-    parser.add_argument("--t-min", type=float, default=0.02)
     parser.add_argument("--p-mean", type=float, default=-0.4)
     parser.add_argument("--p-std", type=float, default=1.0)
     parser.add_argument("--cfg-max", type=float, default=7.0)
@@ -1444,8 +976,6 @@ def parse_args() -> TrainConfig:
         data_root=args.data_root,
         resume=args.resume,
         dataset=args.dataset,
-        backbone=args.backbone,
-        variant=args.variant,
         optimizer=args.optimizer,
         attn_impl=args.attn_impl,
         seed=args.seed,
@@ -1473,15 +1003,11 @@ def parse_args() -> TrainConfig:
         muon_weight_decay=args.muon_weight_decay,
         muon_aux_eps=args.muon_aux_eps,
         grad_clip=args.grad_clip,
-        model_dim=args.model_dim,
-        dim_mults=tuple(args.dim_mults),
-        convnext_mult=args.convnext_mult,
         patch_size=args.patch_size,
         hidden_size=args.hidden_size,
         depth=args.depth,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
-        t_min=args.t_min,
         p_mean=args.p_mean,
         p_std=args.p_std,
         cfg_max=args.cfg_max,
@@ -1540,11 +1066,11 @@ def train(config: TrainConfig) -> Path:
         generator=sample_generator,
         device=device,
     )
-    fixed_labels = build_sample_labels(spec.num_classes, config.sample_batch_size, device) if config.variant == "pmf" else None
+    fixed_labels = build_sample_labels(spec.num_classes, config.sample_batch_size, device)
 
     progress = tqdm(
         range(state.step, config.max_steps),
-        desc=f"Training {config.variant}-{config.dataset}-{config.backbone}",
+        desc=f"Training pMF-{config.dataset}",
     )
 
     for step in progress:
@@ -1581,7 +1107,7 @@ def train(config: TrainConfig) -> Path:
 
         if should_sample:
             with torch.no_grad():
-                samples = generate_samples(model, fixed_noise, config.variant, labels=fixed_labels, config=config)
+                samples = generate_samples(model, fixed_noise, fixed_labels, config)
             save_sample_grid(samples, spec, sample_dir / f"step_{state.step:07d}.png")
 
         if should_save:

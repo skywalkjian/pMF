@@ -35,8 +35,8 @@
 
 ```mermaid
 flowchart LR
-    DATA[CIFAR10 / MNIST] --> TRAIN[meanflow.py]
-    TRAIN --> MODEL[PmfTransformer / MeanFlowTransformer / Unet]
+    DATA[CIFAR10] --> TRAIN[meanflow.py]
+    TRAIN --> MODEL[PmfTransformer]
     MODEL --> OPT[AdamW or Muon]
     TRAIN --> RUN[runs/<exp>/<timestamp>/]
     RUN --> METRICS[metrics.json]
@@ -89,7 +89,7 @@ flowchart LR
    - `pre_attn_residual`
    - `pre_mlp_residual`
 
-4. **在 `PmfTransformer` / `MeanFlowTransformer` 末尾加入 output aggregation**
+4. **在 `PmfTransformer` 末尾加入 output aggregation**
    residual 模式下，最终输出不是直接取“最后一层 token”，而是对整条 depth history 再做一次汇聚。
 
 5. **接入 `Muon`**
@@ -120,7 +120,7 @@ pip install torchvision numpy tqdm matplotlib
 
 ### 2. 运行 smoke test
 
-`meanflow.py` 会自动下载 `MNIST` 或 `CIFAR10`，所以不需要单独 prepare 数据。
+`meanflow.py` 会自动下载 `CIFAR10`，所以不需要单独 prepare 数据。
 
 ```bash
 python meanflow.py \
