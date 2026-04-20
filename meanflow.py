@@ -20,19 +20,26 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+import torch.distributed as tdist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms as T
 from torchvision.datasets import CIFAR10
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
+from kimi_attention import FullAttentionResidual, rms_norm_last_dim
 from optim import SingleDeviceMuonWithAuxAdam
 
 
 def cycle(loader: DataLoader):
+    epoch = 0
     while True:
+        if isinstance(getattr(loader, "sampler", None), DistributedSampler):
+            loader.sampler.set_epoch(epoch)
         for batch in loader:
             yield batch
+        epoch += 1
 
 
 def configure_runtime(deterministic: bool, matmul_precision: str, allow_tf32: bool) -> None:
@@ -52,6 +59,19 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+
+def average_gradients(model: nn.Module, world_size: int) -> None:
+    if world_size <= 1:
+        return
+    for param in model.parameters():
+        if param.grad is not None:
+            tdist.all_reduce(param.grad, op=tdist.ReduceOp.SUM)
+            param.grad.div_(world_size)
+
+
+def is_main_process() -> bool:
+    return not tdist.is_initialized() or tdist.get_rank() == 0
 
 
 def to_serializable(value: Any) -> Any:
@@ -183,31 +203,6 @@ class PatchEmbed(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x).flatten(2).transpose(1, 2)
 
-
-def rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-
-
-class FullAttentionResidual(nn.Module):
-    """
-    Full Attention Residuals from arXiv:2603.15031.
-
-    Each layer uses a learned pseudo-query to attend over the embedding and all
-    preceding layer outputs along the depth axis.
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.query = nn.Parameter(torch.zeros(hidden_size))
-        self.eps = eps
-
-    def forward(self, history: list[torch.Tensor]) -> torch.Tensor:
-        if not history:
-            raise ValueError("FullAttentionResidual expects a non-empty history.")
-        keys = torch.stack(history, dim=2)
-        scores = torch.einsum("d,btnd->btn", self.query, rms_norm_last_dim(keys, eps=self.eps))
-        weights = scores.softmax(dim=-1, dtype=torch.float32).to(keys.dtype)
-        return torch.einsum("btn,btnd->btd", weights, keys)
 
 
 class TransformerAttention(nn.Module):
@@ -698,21 +693,27 @@ def get_dataset_spec(dataset_name: str) -> DatasetSpec:
 def build_datasets(config: TrainConfig):
     spec = get_dataset_spec(config.dataset)
     if config.dataset == "cifar10":
+        if is_main_process():
+            CIFAR10(config.data_root, train=True, download=True)
+            CIFAR10(config.data_root, train=False, download=True)
+        if tdist.is_initialized():
+            tdist.barrier()
         train_transform = T.Compose([T.RandomHorizontalFlip(), T.ToTensor(), T.Normalize(spec.mean, spec.std)])
         eval_transform = T.Compose([T.ToTensor(), T.Normalize(spec.mean, spec.std)])
-        train_dataset = CIFAR10(config.data_root, train=True, transform=train_transform, download=True)
-        eval_dataset = CIFAR10(config.data_root, train=False, transform=eval_transform, download=True)
+        train_dataset = CIFAR10(config.data_root, train=True, transform=train_transform, download=False)
+        eval_dataset = CIFAR10(config.data_root, train=False, transform=eval_transform, download=False)
         return train_dataset, eval_dataset, spec
     raise ValueError(f"Unsupported dataset: {config.dataset}")
 
 
-def build_dataloader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed: int, drop_last: bool) -> DataLoader:
+def build_dataloader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed: int, drop_last: bool, sampler=None) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(shuffle if sampler is None else False),
+        sampler=sampler,
         num_workers=num_workers,
         drop_last=drop_last,
         pin_memory=torch.cuda.is_available(),
@@ -862,7 +863,7 @@ def make_checkpoint(
             "torch": torch.random.get_rng_state(),
             "numpy": np.random.get_state(),
             "python": random.getstate(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         },
     }
 
@@ -893,9 +894,9 @@ def _restore_rng_state(rng_state: dict[str, Any]) -> None:
     cuda_state = rng_state.get("cuda")
     if torch.cuda.is_available() and cuda_state is not None:
         if isinstance(cuda_state, (list, tuple)):
-            torch.cuda.set_rng_state_all([_coerce_rng_state_tensor(state) for state in cuda_state])
+            torch.cuda.set_rng_state(_coerce_rng_state_tensor(cuda_state[0]))
         else:
-            torch.cuda.set_rng_state_all([_coerce_rng_state_tensor(cuda_state)])
+            torch.cuda.set_rng_state(_coerce_rng_state_tensor(cuda_state))
 
 
 def restore_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> RunState:
@@ -1026,17 +1027,38 @@ def parse_args() -> TrainConfig:
 def train(config: TrainConfig) -> Path:
     if config.grad_accum_steps < 1:
         raise ValueError("grad_accum_steps must be >= 1.")
-    set_seed(config.seed)
-    device = torch.device(config.device)
+
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if distributed:
+        if not tdist.is_initialized():
+            tdist.init_process_group(backend="nccl")
+        rank = tdist.get_rank()
+        world_size = tdist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        rank = 0
+        world_size = 1
+        device = torch.device(config.device)
+
+    set_seed(config.seed + rank)
+
     run_dir = get_run_dir(config)
     sample_dir = run_dir / "samples"
     checkpoint_dir = run_dir / "checkpoints"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        run_dir.mkdir(parents=True, exist_ok=True)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        tdist.barrier()
 
     train_dataset, eval_dataset, spec = build_datasets(config)
-    train_loader = build_dataloader(train_dataset, config.batch_size, True, config.num_workers, config.seed, True)
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=config.seed,
+    ) if distributed else None
+    train_loader = build_dataloader(train_dataset, config.batch_size, True, config.num_workers, config.seed, True, sampler=train_sampler)
     eval_loader = build_dataloader(eval_dataset, config.batch_size, False, config.num_workers, config.seed, False)
     train_iter = cycle(train_loader)
 
@@ -1047,14 +1069,19 @@ def train(config: TrainConfig) -> Path:
 
     if config.resume:
         state = restore_checkpoint(config.resume, model, optimizer, device)
+        if distributed:
+            torch.manual_seed(config.seed + rank + state.step)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(config.seed + rank + state.step)
 
-    save_json(
-        run_dir / "config.json",
-        {
-            "config": {key: to_serializable(value) for key, value in asdict(config).items()},
-            "dataset": asdict(spec),
-        },
-    )
+    if is_main_process():
+        save_json(
+            run_dir / "config.json",
+            {
+                "config": {key: to_serializable(value) for key, value in asdict(config).items()},
+                "dataset": asdict(spec),
+            },
+        )
 
     sample_generator = torch.Generator(device=device.type if device.type == "cuda" else "cpu")
     sample_generator.manual_seed(config.seed)
@@ -1071,6 +1098,7 @@ def train(config: TrainConfig) -> Path:
     progress = tqdm(
         range(state.step, config.max_steps),
         desc=f"Training pMF-{config.dataset}",
+        disable=not is_main_process(),
     )
 
     for step in progress:
@@ -1086,6 +1114,7 @@ def train(config: TrainConfig) -> Path:
             microbatch_losses.append(float(loss.item()))
             (loss / config.grad_accum_steps).backward()
 
+        average_gradients(model, world_size)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         optimizer.step()
 
@@ -1099,33 +1128,38 @@ def train(config: TrainConfig) -> Path:
         should_sample = state.step % config.sample_every == 0 or state.step == config.max_steps
         should_save = state.step % config.save_every == 0 or state.step == config.max_steps
 
-        if should_eval:
+        if should_eval and is_main_process():
             val_loss = evaluate_loss(model, loss_fn, eval_loader, device)
             state.val_loss.append(val_loss)
             state.best_val_loss = min(state.best_val_loss, val_loss)
             progress.set_postfix(loss=f"{step_loss:.2e}", avg=f"{avg_loss:.2e}", val=f"{val_loss:.2e}", best=f"{state.best_val_loss:.2e}")
 
-        if should_sample:
+        if should_sample and is_main_process():
             with torch.no_grad():
                 samples = generate_samples(model, fixed_noise, fixed_labels, config)
             save_sample_grid(samples, spec, sample_dir / f"step_{state.step:07d}.png")
 
         if should_save:
-            checkpoint = make_checkpoint(model, optimizer, config, state)
-            torch.save(checkpoint, checkpoint_dir / "last.pt")
-            torch.save(checkpoint, checkpoint_dir / f"step_{state.step:07d}.pt")
-            if state.val_loss and state.val_loss[-1] <= state.best_val_loss:
-                torch.save(checkpoint, checkpoint_dir / "best.pt")
-            save_json(
-                run_dir / "metrics.json",
-                {
-                    "step": state.step,
-                    "best_val_loss": state.best_val_loss,
-                    "train_loss": state.train_loss,
-                    "val_loss": state.val_loss,
-                },
-            )
+            if is_main_process():
+                checkpoint = make_checkpoint(model, optimizer, config, state)
+                torch.save(checkpoint, checkpoint_dir / "last.pt")
+                torch.save(checkpoint, checkpoint_dir / f"step_{state.step:07d}.pt")
+                if state.val_loss and state.val_loss[-1] <= state.best_val_loss:
+                    torch.save(checkpoint, checkpoint_dir / "best.pt")
+                save_json(
+                    run_dir / "metrics.json",
+                    {
+                        "step": state.step,
+                        "best_val_loss": state.best_val_loss,
+                        "train_loss": state.train_loss,
+                        "val_loss": state.val_loss,
+                    },
+                )
+            if distributed:
+                tdist.barrier()
 
+    if distributed:
+        tdist.destroy_process_group()
     return run_dir
 
 

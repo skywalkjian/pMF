@@ -114,8 +114,7 @@ flowchart LR
 ### 1. 安装依赖
 
 ```bash
-pip install -r requirements.txt
-pip install torchvision numpy tqdm matplotlib
+uv sync
 ```
 
 ### 2. 运行 smoke test
@@ -123,7 +122,7 @@ pip install torchvision numpy tqdm matplotlib
 `meanflow.py` 会自动下载 `CIFAR10`，所以不需要单独 prepare 数据。
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/smoke_pmf_cifar10 \
   --dataset cifar10 \
   --backbone transformer \
@@ -143,7 +142,7 @@ python meanflow.py \
 ### 3. 运行 `AdamW + naive`
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_adamw_transformer_naive_fixcheck \
   --dataset cifar10 \
   --backbone transformer \
@@ -163,7 +162,7 @@ python meanflow.py \
 ### 4. 运行 `Muon + naive`
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_muon_transformer_naive_fixcheck \
   --dataset cifar10 \
   --backbone transformer \
@@ -183,7 +182,7 @@ python meanflow.py \
 ### 5. 运行 `Muon + residual`
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_muon_transformer_residual_fixcheck \
   --dataset cifar10 \
   --backbone transformer \
@@ -203,7 +202,7 @@ python meanflow.py \
 ### 6. 计算 FID
 
 ```bash
-python fid_eval.py \
+uv run python fid_eval.py \
   --run-dir ./runs/cifar10_pmf_muon_transformer_residual_fixcheck/<timestamp> \
   --checkpoint last \
   --data-root ./data \
@@ -220,17 +219,43 @@ python fid_eval.py \
 ### 7. 绘制对照图
 
 ```bash
-python scripts/plot_fixcheck_metrics.py
+uv run python scripts/plot_fixcheck_metrics.py
 ```
 
 生成：
 
 - `assets/showcase/fixcheck_metrics_comparison.png`
 
-### 8. 恢复训练
+### 8. 多卡训练
+
+pMF 支持多卡分布式训练（通过手动梯度 all-reduce 实现，因 `torch.func.jvp` 与 DDP 不兼容）。使用 `torchrun` 启动：
 
 ```bash
-python meanflow.py \
+uv run torchrun --nproc_per_node=2 meanflow.py \
+  --workdir ./runs/cifar10_pmf_muon_2gpu \
+  --optimizer muon \
+  --attn-impl naive \
+  --batch-size 128 \
+  --grad-accum-steps 1 \
+  --max-steps 10000 \
+  --eval-every 250 \
+  --sample-every 200 \
+  --save-every 500 \
+  --sample-batch-size 8 \
+  --num-workers 4
+```
+
+说明：
+
+- `--batch-size` 是**每张卡**的 batch size。2 卡 `--batch-size 128` 时，有效 batch size 为 `128 × 2 = 256`
+- 单卡训练 `python meanflow.py ...` 仍然完全兼容，无需任何修改
+- 评估、采样和 checkpoint 保存只在 rank 0 执行
+- 梯度在所有卡之间做 all-reduce 取平均后，再执行 clip 和 optimizer.step
+
+### 9. 恢复训练
+
+```bash
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_muon_transformer_residual_fixcheck \
   --dataset cifar10 \
   --backbone transformer \

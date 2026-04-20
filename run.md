@@ -4,20 +4,20 @@
 
 ```bash
 cd pMF
-pip install -r requirements.txt
+uv sync
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
 训练入口：
 
 ```bash
-python meanflow.py ...
+uv run python meanflow.py ...
 ```
 
 FID 入口：
 
 ```bash
-python fid_eval.py ...
+uv run python fid_eval.py ...
 ```
 
 每次训练会在 `--workdir/<timestamp>/` 下生成：
@@ -30,7 +30,7 @@ python fid_eval.py ...
 ## 1. 先跑 smoke
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/smoke_pmf_cifar10 \
   --dataset cifar10 \
   --backbone transformer \
@@ -59,7 +59,7 @@ python meanflow.py \
 ### pMF + AdamW + naive
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_adamw_transformer_naive \
   --dataset cifar10 \
   --backbone transformer \
@@ -79,7 +79,7 @@ python meanflow.py \
 ### pMF + Muon + naive
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_muon_transformer_naive \
   --dataset cifar10 \
   --backbone transformer \
@@ -99,7 +99,7 @@ python meanflow.py \
 ### pMF + Muon + residual
 
 ```bash
-python meanflow.py \
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_muon_transformer_residual \
   --dataset cifar10 \
   --backbone transformer \
@@ -116,10 +116,56 @@ python meanflow.py \
   --num-workers 4
 ```
 
-## 3. 恢复训练
+## 3. 多卡训练
+
+使用 `torchrun` 启动多卡分布式训练。`--batch-size` 是每张卡的 batch size。
+
+### 2 卡 pMF + Muon + naive
 
 ```bash
-python meanflow.py \
+uv run torchrun --nproc_per_node=2 meanflow.py \
+  --workdir ./runs/cifar10_pmf_muon_transformer_naive_2gpu \
+  --dataset cifar10 \
+  --optimizer muon \
+  --attn-impl naive \
+  --max-steps 5000 \
+  --batch-size 128 \
+  --grad-accum-steps 1 \
+  --eval-every 250 \
+  --sample-every 500 \
+  --save-every 500 \
+  --sample-batch-size 8 \
+  --num-workers 4
+```
+
+### 2 卡 pMF + Muon + residual
+
+```bash
+uv run torchrun --nproc_per_node=2 meanflow.py \
+  --workdir ./runs/cifar10_pmf_muon_transformer_residual_2gpu \
+  --dataset cifar10 \
+  --optimizer muon \
+  --attn-impl residual \
+  --max-steps 5000 \
+  --batch-size 128 \
+  --grad-accum-steps 1 \
+  --eval-every 250 \
+  --sample-every 500 \
+  --save-every 500 \
+  --sample-batch-size 8 \
+  --num-workers 4
+```
+
+说明：
+
+- 2 卡 `--batch-size 128` 对应有效 batch 为 `128 × 2 = 256`，与单卡 `--batch-size 32 --grad-accum-steps 8` 等效
+- 多卡恢复训练同样用 `torchrun` 启动，加上 `--resume` 即可
+- 单卡 `python meanflow.py ...` 仍然完全兼容
+
+## 4. 恢复训练
+
+```bash
+uv run python meanflow.py \
   --workdir ./runs/cifar10_pmf_muon_transformer_residual \
   --dataset cifar10 \
   --backbone transformer \
@@ -137,14 +183,14 @@ python meanflow.py \
   --resume ./runs/cifar10_pmf_muon_transformer_residual/<timestamp>/checkpoints/last.pt
 ```
 
-## 4. 跑 FID
+## 5. 跑 FID
 
 默认用 `best.pt`，参考集用 `cifar10-train`。
 
 ### 单组命令模板
 
 ```bash
-python fid_eval.py \
+uv run python fid_eval.py \
   --run-dir ./runs/cifar10_pmf_adamw_transformer_naive/<timestamp> \
   --checkpoint best \
   --data-root ./data \
@@ -157,9 +203,9 @@ python fid_eval.py \
 ### 三组命令
 
 ```bash
-python fid_eval.py --run-dir ./runs/cifar10_pmf_adamw_transformer_naive/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
-python fid_eval.py --run-dir ./runs/cifar10_pmf_muon_transformer_naive/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
-python fid_eval.py --run-dir ./runs/cifar10_pmf_muon_transformer_residual/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
+uv run python fid_eval.py --run-dir ./runs/cifar10_pmf_adamw_transformer_naive/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
+uv run python fid_eval.py --run-dir ./runs/cifar10_pmf_muon_transformer_naive/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
+uv run python fid_eval.py --run-dir ./runs/cifar10_pmf_muon_transformer_residual/<timestamp> --checkpoint best --data-root ./data --num-samples 50000 --gen-bsz 128 --fid-batch-size 128 --device cuda
 ```
 
 结果会写到：
@@ -169,7 +215,7 @@ python fid_eval.py --run-dir ./runs/cifar10_pmf_muon_transformer_residual/<times
 如果你想保留生成图：
 
 ```bash
-python fid_eval.py \
+uv run python fid_eval.py \
   --run-dir ./runs/cifar10_pmf_muon_transformer_residual/<timestamp> \
   --checkpoint best \
   --data-root ./data \
@@ -180,7 +226,7 @@ python fid_eval.py \
   --keep-samples
 ```
 
-## 5. 结果怎么看
+## 6. 结果怎么看
 
 训练时主要看：
 
@@ -195,7 +241,7 @@ FID 主要看：
 - `fid/metrics_best_50000.json`
 - 其中的 `metrics.frechet_inception_distance`
 
-## 6. 重要说明
+## 7. 重要说明
 
 - 修复后的 `pMF` 只支持 `transformer`。
 - `Muon` 只用于 `variant=pmf`。

@@ -32,12 +32,13 @@ def initialize():
     if "WORLD_SIZE" not in os.environ:
         os.environ["WORLD_SIZE"] = "1"
 
-    backend = "gloo" if os.name == "nt" else "nccl"
+    backend = "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
     print(
         f"Initializing torch distributed with backend={backend} and init_method=env://"
     )
     torch.distributed.init_process_group(backend=backend, init_method="env://")
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
 
     sync_device = torch.device("cuda") if process_count() > 1 else None
     init_multiprocessing(rank=process_index(), sync_device=sync_device)

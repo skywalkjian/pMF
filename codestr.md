@@ -71,19 +71,21 @@ pMF/
 ```text
 parse_args
   -> train
-    -> set_seed
-    -> build_datasets / build_dataloader / cycle
+    -> 分布式初始化（检测 WORLD_SIZE，init_process_group）
+    -> set_seed(seed + rank)
+    -> build_datasets / build_dataloader(sampler=DistributedSampler) / cycle
     -> build_model          -> PmfTransformer
     -> build_optimizer      -> AdamW 或 Muon
     -> build_loss           -> PixelMeanFlowLoss
     -> for each step:
          -> loss_fn(model, images, labels)
          -> backward
+         -> average_gradients（多卡梯度 all-reduce）
          -> optimizer.step
-         -> evaluate_loss
-         -> generate_samples -> generate_pmf
-         -> save_sample_grid
-         -> make_checkpoint / save_json
+         -> evaluate_loss          （仅 rank 0）
+         -> generate_samples       （仅 rank 0）
+         -> make_checkpoint        （仅 rank 0，后接 barrier）
+    -> destroy_process_group
 ```
 
 #### 4.2 pMF 采样与 FID 链
@@ -372,9 +374,11 @@ SwiGLU 风格 MLP：`w2(silu(w1(x)) * w3(x))`，三个线性投影（`w1` + `w3`
 
 ### 1. 基础工具函数
 
-- `cycle(loader)` — 把 DataLoader 包装成无限迭代器
+- `cycle(loader)` — 把 DataLoader 包装成无限迭代器；当 sampler 为 `DistributedSampler` 时，在每个 epoch 边界自动调用 `set_epoch`
 - `configure_runtime(...)` — 设置 cudnn/TF32/matmul 精度（尚未接入主流程）
 - `set_seed(seed)` — 统一设置 Python/NumPy/PyTorch 随机种子
+- `average_gradients(model, world_size)` — 遍历所有参数，对梯度做 all-reduce 后除以 world_size；单卡时为 no-op
+- `is_main_process()` — 判断当前进程是否为 rank 0（或未初始化分布式）
 - `to_serializable(value)` — 把 `Path`/`tuple` 转成 JSON 可写格式
 
 ### 2. Transformer 组件
@@ -577,7 +581,7 @@ Kimi-style 残差注意力（arXiv:2603.15031）。替代标准 `x = x + f(x)` �
 
 ### `build_dataloader`
 
-为给定数据集创建 `DataLoader`，带固定种子的 `torch.Generator`。
+为给定数据集创建 `DataLoader`，带固定种子的 `torch.Generator`。支持可选的 `sampler` 参数，多卡训练时传入 `DistributedSampler` 以实现数据分片。
 
 ### `build_model`
 
@@ -606,14 +610,23 @@ Kimi-style 残差注意力（arXiv:2603.15031）。替代标准 `x = x + f(x)` �
 ### `train`
 
 - 作用：
-  执行一次完整训练并返回 run 目录。
+  执行一次完整训练并返回 run 目录。支持单卡和多卡分布式训练。
+- 分布式策略：
+  由于 `PixelMeanFlowLoss` 使用 `torch.func.jvp`（前向模式自动微分），与 DDP 的 backward hook 不兼容，因此不使用 `DistributedDataParallel` 封装模型，而是在 backward 完成后手动对梯度做 all-reduce。
 - 内部流程：
-  1. 设随机种子，创建目录
-  2. 构造数据、模型、优化器、loss
-  3. 可选 resume checkpoint
-  4. 构造固定采样噪声和标签
-  5. 主循环：梯度累积 -> clip grad -> optimizer.step -> 按间隔验证/采样/保存
-  6. 保存最新/best checkpoint 与 `metrics.json`
+  1. 检测 `WORLD_SIZE` 环境变量，初始化分布式进程组（`nccl` 后端）
+  2. 按 rank 偏移随机种子 `set_seed(seed + rank)`，确保各卡数据/噪声不同
+  3. 仅 rank 0 创建目录，之后 barrier 同步
+  4. 构造数据（多卡时使用 `DistributedSampler`）、模型、优化器、loss
+  5. 可选 resume checkpoint，resume 后重新偏移种子
+  6. 构造固定采样噪声和标签
+  7. 主循环：梯度累积 -> `average_gradients` -> clip grad -> optimizer.step
+  8. 验证/采样/保存仅在 rank 0 执行，checkpoint 保存后加 barrier
+  9. 训练结束后调用 `destroy_process_group`
+- 启动方式：
+  - 单卡：`python meanflow.py ...`（与之前完全兼容）
+  - 多卡：`torchrun --nproc_per_node=N meanflow.py ...`
+  - `--batch-size` 为每张卡的 batch size，有效 batch = `batch_size × world_size × grad_accum_steps`
 
 ## `optim/muon.py` Muon 优化器实现
 
